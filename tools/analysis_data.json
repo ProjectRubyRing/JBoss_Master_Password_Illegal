@@ -1,0 +1,2449 @@
+{
+ "meta": {
+  "title": "JBOSS_MASTER_PASSWORD 特殊文字影響分析",
+  "date": "2026-09-15",
+  "targets": "# / $ / ^ / ! / 半角スペース / タブ / 実改行 LF（内部・末尾） / `\\n` 2 文字リテラル / \\ / | / ${ / ${}",
+  "revised": "2026-09-15（第 2 版：AWS パラメータストア登録経路と ${ / ${} / \\n 表記ゆれを追加）",
+  "verify_env": "GNU bash 5.2.21 / dash、OpenJDK 21.0.10、AWS CLI 1.46.1 + botocore 1.43、jboss-dmr 1.6.1.Final"
+ },
+ "stages": [
+  {
+   "id": "A1",
+   "name": "パラメータストアへの登録",
+   "code": "aws ssm put-parameter --type SecureString --value <値>  /  aws secretsmanager create-secret --secret-string <値>  /  マネジメントコンソールのテキストエリア  /  CloudFormation・Terraform",
+   "handling": "AWS 側は完全に素通しである。PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種パターン制約が存在しない（実測 E-20）。実 LF もタブも非 ASCII も ${} もそのまま保存される。値が決まるのは AWS ではなく「何を Value に渡したか」を決める入力経路の側であり、AWS CLI の --value は一切のエスケープ解釈を行わない一方、--cli-input-json は JSON デコードを行う（実測 E-19）。",
+   "focus": "ここは「入力表記 → 実バイト列」の翻訳段として見る。同じ見た目の入力が経路ごとに別のバイト列になり、しかも AWS は何も警告しない。"
+  },
+  {
+   "id": "A2",
+   "name": "パラメータストアからの取得",
+   "code": "aws ssm get-parameter --with-decryption --query Parameter.Value --output text  /  aws secretsmanager get-secret-value --query SecretString --output text",
+   "handling": "KMS 復号自体はバイト透過。値を壊すのは出力整形である。--output text は値をそのまま書き出したうえで必ず末尾に LF を 1 個足す（実測 E-21）。--output json は JSON エスケープして出力するため情報を失わない。複数形 API（get-parameters）の text 出力はタブ区切り行形式のため、値に含まれる LF・タブが行／列の境界と区別できなくなる（実測 E-22）。",
+   "focus": "--output text と $( ) の組み合わせが値末尾の LF を無言で消す。ここが「登録した値」と「起動時の値」が食い違う最大の発生源。"
+  },
+  {
+   "id": "A3",
+   "name": "取得値のコンテナへの受け渡し",
+   "code": "printf '%s' \"$(aws ssm get-parameter ...)\" > ./secrets/jboss_master_password  /  ECS タスク定義 secrets[].valueFrom  /  docker run -e  /  docker run --env-file",
+   "handling": "シークレットファイル経由なら生バイト列、ECS のシークレット注入と -e は environ へ直接設定されるため再解釈は起きない。--env-file だけは行指向テキストであり、LF を含む値を表現できず、行頭 # や行末空白の扱いも実装依存。またこの段で echo -e / printf '%b' / dash・ash の echo を経由すると、\\n 2 文字リテラルが実 LF に変換される（実測 E-25）。",
+   "focus": "ビルド時と実行時で同じ経路を使うこと。経路が違うと 1 バイトずれ、JCEKS が開けなくなる。"
+  },
+  {
+   "id": "S1",
+   "name": "BuildKit シークレット → 環境変数",
+   "code": "Dockerfile: RUN --mount=type=secret,id=jboss_master_password,env=JBOSS_MASTER_PASSWORD,required=true",
+   "handling": "シークレットファイルの生バイト列をそのまま環境変数に設定する。シェルによる解釈は一切介在しない。NUL のみ格納不可。",
+   "focus": "末尾 LF が値に混入する典型的な落とし穴。"
+  },
+  {
+   "id": "S2",
+   "name": "base.cli の式解決（WildFly ExpressionResolver）",
+   "code": "/subsystem=elytron/credential-store=EAPCS:add(..., credential-reference={clear-text=\"${env.JBOSS_MASTER_PASSWORD}\"}, create=true)",
+   "handling": "パスワードの実値は .cli ファイル本文に一切出現しない。CLI は既定では式を解決せず（resolve-parameter-values 既定 false）、文字列 ${env.…} のまま管理層へ送られ、サーバ側が解決する。standalone.xml には式のまま永続化される。",
+   "focus": "値がテキストとして CLI 構文・XML 構文を通らないため、本段は本質的に安全。"
+  },
+  {
+   "id": "S3",
+   "name": "base-env.sh での再 export",
+   "code": "export JBOSS_MASTER_PASSWORD=${JBOSS_MASTER_PASSWORD}（非クォート）",
+   "handling": "export は宣言コマンド（declaration utility）であり、name=word 形式の引数は代入と同様に展開される。すなわち単語分割・パス名展開は行われない。bash 5.3 / bash --posix / dash のいずれでも実測確認済み。",
+   "focus": "現状は偶然通っているだけ。仕様依存であり必ずクォートすべき。"
+  },
+  {
+   "id": "S4",
+   "name": "create-admin-user.sh",
+   "code": "${JBOSS_HOME}/bin/add-user.sh -sc ${JBOSS_HOME}/standalone/configuration \"${JBOSS_ADMIN_USER}\" \"${JBOSS_ADMIN_PASSWORD}\"",
+   "handling": "パスワードはダブルクォート済みで単一の argv 要素として JVM へ渡る。管理レルムのパスワードは HEX(MD5(user:realm:pass)) にハッシュ化して mgmt-users.properties へ保存されるため、値そのものが properties 構文を通ることはない。",
+   "focus": "-sc の引数が非クォートである点のみ別途要修正。"
+  },
+  {
+   "id": "S5",
+   "name": "store_credentials.sh",
+   "code": "printenv | grep -v JBOSS_MASTER_PASSWORD | while read line → [[ =~ ]] → jboss_credential_store の $*",
+   "handling": "本パイプライン中で唯一、パスワードを「テキスト行」として再パースする段。行指向読み取り・エスケープ解釈・IFS 分割・グロブ展開の 4 つが重なる。",
+   "focus": "特殊文字事故のほぼ全てがここに集中する。"
+  },
+  {
+   "id": "S6",
+   "name": "ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "code": "eval \\\"$JAVA\\\" $JAVA_OPTS -jar ... '\"$@\"'",
+   "handling": "eval が再パースするのはテキスト \"$@\" であり、$@ の展開結果は再展開されない。したがって値中の $ ` \\ \" は再解釈されない。",
+   "focus": "この eval は安全側の定石。ただし $JAVA_OPTS 非クォートは別のリスク。"
+  },
+  {
+   "id": "S7",
+   "name": "実行時 standalone.sh",
+   "code": "exec ${JBOSS_HOME}/bin/standalone.sh -b 0.0.0.0 -bmanagement 0.0.0.0 -c standalone.xml",
+   "handling": "standalone.xml 内の ${env.JBOSS_MASTER_PASSWORD} をサーバ JVM の環境変数から解決し、JCEKS を開く。ビルド時／初回作成時に使われた値とバイト単位で一致する必要がある。",
+   "focus": "実行時コンテナにも同じ環境変数が必須。"
+  },
+  {
+   "id": "S8",
+   "name": "資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "code": "secrets.jceks への SecretKeyEntry 格納（base.cli の create=true 後の add-alias、elytron-tool.sh --add、実行時の資格情報登録）",
+   "handling": "Elytron の KeyStoreCredentialStore は各資格情報を JCEKS の SecretKeyEntry として格納し、ストアパスワードで PBE 保護する。SunJCE の鍵導出がパスワードを印字可能 ASCII (0x20-0x7E) に限定するため、範囲外の文字は InvalidKeySpecException で拒否される。",
+   "focus": "シェルの修正では回避できない、本環境における最終的な関門。空ストア作成（MAC のみ）は通るため、失敗は最初のエイリアス登録まで遅延する。"
+  }
+ ],
+ "chars": [
+  {
+   "key": "#",
+   "notation": "U+0023 シャープ",
+   "verdict": "問題なし",
+   "break_at": "—",
+   "summary": "シェルのコメント認識はトークナイズ時のみ。展開結果は再スキャンされないため、値の中の # は常にデータ。"
+  },
+  {
+   "key": "$",
+   "notation": "U+0024 ドル",
+   "verdict": "問題なし（注入境界のみ要注意）",
+   "break_at": "—",
+   "summary": "WildFly の式解決は解決結果を再走査しない。シェルも展開結果を再展開しない。ただし docker compose / K8s の値補間は別問題。 なお ${ と ${} は挙動が分かれるため独立の行として後述する。"
+  },
+  {
+   "key": "^",
+   "notation": "U+005E ハット",
+   "verdict": "問題なし",
+   "break_at": "—",
+   "summary": "POSIX シェルのメタ文字ではない。ERE の ^ はパターン側の意味で、被検査文字列側には影響しない。"
+  },
+  {
+   "key": "!",
+   "notation": "U+0021 エクスクラメーション",
+   "verdict": "問題なし",
+   "break_at": "—",
+   "summary": "履歴展開は対話シェル限定。非対話スクリプトでは set -H しても無効。"
+  },
+  {
+   "key": "半角スペース",
+   "notation": "U+0020 半角スペース",
+   "verdict": "問題あり",
+   "break_at": "S5 store_credentials.sh",
+   "summary": "read の行末トリムで末尾空白が消え、$* の単語分割で --secret 値が複数引数に割れる。"
+  },
+  {
+   "key": "タブ",
+   "notation": "U+0009 水平タブ",
+   "verdict": "致命的",
+   "break_at": "S8 JCEKS 層 / S5 store_credentials.sh",
+   "summary": "OpenJDK の SunJCE が PBE パスワードを印字可能 ASCII (0x20-0x7E) に限定するため、タブは資格情報ストアに格納できない（実測）。シェル側の $* 分割・read の行末トリムも重なる。"
+  },
+  {
+   "key": "実改行 LF（内部）",
+   "notation": "U+000A（値の途中に Enter）",
+   "verdict": "致命的",
+   "break_at": "S8 JCEKS 層 / S5 / A2 / S7",
+   "summary": "JCEKS が改行を含むパスワードを拒否する（OpenJDK 21 で実測）。加えて printenv の行分割で値が切り詰められ、grep -v を素通りした後続行が正規表現に一致して資格情報ストアへ任意エイリアスを注入できる。パラメータストア自体は何の警告もなく保存するため、事故は必ず起動時まで遅延する。"
+  },
+  {
+   "key": "実改行 LF（末尾）",
+   "notation": "U+000A（値の末尾に Enter）",
+   "verdict": "致命的（かつ無言）",
+   "break_at": "A2 / A3 / S8 JCEKS 層",
+   "summary": "AWS は末尾 LF を保存するが、aws ... --output text が足す LF と区別できず $( ) が両方まとめて削る。登録値と起動時の値が無言で食い違い、逆にリダイレクトで保存すると 1 バイト増える。JCEKS は末尾 LF も拒否する（実測）。"
+  },
+  {
+   "key": "\\n（2 文字リテラル）",
+   "notation": "U+005C + U+006E（バックスラッシュと n の 2 文字）",
+   "verdict": "問題あり",
+   "break_at": "A1 表記ゆれ / A3 / S5 store_credentials.sh",
+   "summary": "改行のつもりで \\n と打つと、--value 経由では 5C 6E の 2 文字がそのまま保存され（実測）、--cli-input-json 経由では実 LF 1 文字になる。2 文字のままなら JCEKS は受理するが、store_credentials.sh の read（-r 欠落）がバックスラッシュを食って panss のような別の値になる（実測）。"
+  },
+  {
+   "key": "\\",
+   "notation": "U+005C バックスラッシュ",
+   "verdict": "問題あり",
+   "break_at": "S5 store_credentials.sh",
+   "summary": "read に -r が無いため \\ がエスケープとして食われ、行末 \\ は次行と連結して隣の秘密情報まで破壊する。"
+  },
+  {
+   "key": "|",
+   "notation": "U+007C パイプ",
+   "verdict": "問題なし",
+   "break_at": "—",
+   "summary": "| は演算子としてトークナイズ時にのみ認識される。展開結果は再トークナイズされないため常にデータ。"
+  },
+  {
+   "key": "${",
+   "notation": "U+0024 + U+007B（閉じ括弧なし）",
+   "verdict": "条件付き致命（現行設計では問題なし）",
+   "break_at": "S2 / S7（実値を直書きした場合のみ）",
+   "summary": "現行の ${env.JBOSS_MASTER_PASSWORD} 方式では解決結果が再走査されないため完全に無害（実測）。しかし実値を .cli や standalone.xml に直書きする運用へ変えた瞬間、IllegalStateException: Incomplete expression でサーバが起動しなくなる（実測）。IaC 経由で登録する場合は CloudFormation Fn::Sub / Terraform 側の補間にも注意。"
+  },
+  {
+   "key": "${}",
+   "notation": "U+0024 + U+007B + U+007D（空の式）",
+   "verdict": "条件付き致命（現行設計では問題なし）",
+   "break_at": "S2 / S7（実値を直書きした場合のみ）",
+   "summary": "${ と同じく現行設計では無害（実測）。直書きすると IllegalArgumentException: key can't be empty となり起動不能。エスケープは $$ で、$${} と書けば ${} 1 個に解決される（実測）。"
+  }
+ ],
+ "priority_items": [
+  {
+   "severity": "最優先",
+   "title": "パラメータストアは JCEKS が扱えない値も何の警告もなく保存する",
+   "content": "PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種のパターン制約が存在しない（実測 E-20）。Enter で入れた改行 (0x0A) もタブも非 ASCII もそのまま保存される。つまり登録段階では誰も間違いに気付けず、失敗は必ず起動時まで遅延する。",
+   "remedy": "put-parameter の前段に 0x20-0x7E の範囲チェックを置き、登録そのものを拒否する（第 6 章 0.）。AWS 側での事前検出は期待してはならない。"
+  },
+  {
+   "severity": "最優先",
+   "title": "PW=$(aws ... --output text) が値末尾の改行を無言で落とす",
+   "content": "--output text は値の後ろに必ず LF を 1 個足す（実測 E-21）。$( ) は末尾の LF を『すべて』除去する（実測 E-23）。両者の LF を区別できないため、末尾に Enter を含むパスワードは登録値と取得値が食い違う。エラーも警告も出ない。",
+   "remedy": "--output json で取得し jq -j -r でファイルへ直接書き出す。取得直後にバイト長を照合する（第 6 章 0.）。"
+  },
+  {
+   "severity": "重大",
+   "title": "既存の grep による ASCII 範囲チェックは改行を検出できない",
+   "content": "printf '%s' \"$PW\" | LC_ALL=C grep -q '[^ -~]' は grep が行指向であるため、LF そのものを『内容』として見ることができない。実測 E-30 で、内部改行・末尾改行のいずれも見逃すことを確認した（タブと非 ASCII は検出できる）。本書の前版 9.3 に記載した確認コマンドはこの欠陥を持つ。",
+   "remedy": "od で 16 進化してからバイト単位で判定する（第 6 章 0. の bytes_out_of_range）。9.3 の確認コマンドも差し替えた。"
+  },
+  {
+   "severity": "重大",
+   "title": "実値を .cli / standalone.xml に直書きすると ${ と ${} でサーバが起動しない",
+   "content": "現行の ${env.JBOSS_MASTER_PASSWORD} 方式は解決結果を再走査しないため ${ も ${} も完全に無害である（実測 E-27）。しかし実値を直書きする運用へ変えた瞬間、${ は IllegalStateException: Incomplete expression、${} は IllegalArgumentException: key can't be empty となる（実測 E-28）。",
+   "remedy": "base.cli に実値を直書きしない。--resolve-parameter-values を使わない。やむを得ない場合は $ を $$ にエスケープする。"
+  },
+  {
+   "severity": "最優先",
+   "title": "JCEKS がタブ・改行・非 ASCII のパスワードを受け付けない（OpenJDK の仕様）",
+   "content": "OpenJDK の SunJCE は JCEKS 秘密鍵エントリの PBE 保護パスワードを印字可能 ASCII (0x20-0x7E) に限定する。0x00-0xFF を走査し受理されたのは 95 文字のみであることを実測した。しかも空ストア作成は成功し、最初のエイリアス登録で初めて失敗するため、ビルドは通って起動で落ちる。",
+   "remedy": "パスワードを 0x20-0x7E に限定し、起動前に範囲チェックを行って明示的に落とす。"
+  },
+  {
+   "severity": "最優先",
+   "title": "Dockerfile の --mount= 内のカンマ直後に空白がある",
+   "content": "BuildKit の CSV パーサがキー名を認識できず build が失敗する。",
+   "remedy": "--mount=type=secret,id=jboss_master_password,env=JBOSS_MASTER_PASSWORD,required=true（空白なし）。"
+  },
+  {
+   "severity": "重大",
+   "title": "LF を含むマスターパスワードによる資格情報ストアへのエイリアス注入",
+   "content": "printenv | grep -v JBOSS_MASTER_PASSWORD は先頭行しか除去しない。2 行目以降がループへ流入し JBOSS_(.*_PASSWORD)=(.*) に一致すると任意のエイリアスを登録・上書きできる（実測で再現）。",
+   "remedy": "printenv を廃止し compgen -e + 間接展開へ置換。加えて CR/LF を含む値を起動時に拒否する。"
+  },
+  {
+   "severity": "重大",
+   "title": "パスワードがコマンドライン引数に載る",
+   "content": "elytron-tool.sh --password / add-user.sh の引数は ps -ef および /proc/<pid>/cmdline から同一 PID 名前空間の他プロセスに読まれる。",
+   "remedy": "jboss-cli の add-alias(secret-value=\"${env.…}\") 方式へ寄せ、argv からパスワードを排除する。"
+  },
+  {
+   "severity": "重大",
+   "title": "ビルド時と実行時でパスワードがバイト一致しないと起動不能",
+   "content": "BuildKit の env= はシークレットファイルの生バイト列を渡すため、末尾 LF がそのまま値に含まれる。実行時に -e で渡した値と食い違い JCEKS が開けない。",
+   "remedy": "シークレットは printf '%s' で末尾 LF なしに生成し、ビルド時にアサートする。"
+  },
+  {
+   "severity": "中",
+   "title": "正規表現が未アンカーかつ貪欲",
+   "content": "MY_JBOSS_ADMIN_PASSWORD のような無関係変数も一致し、値に _PASSWORD= を含むとキャプチャ位置がずれる（実測で再現）。",
+   "remedy": "変数名の列挙と完全一致判定に置き換える。"
+  },
+  {
+   "severity": "中",
+   "title": "『\\n』と打ったときに何が保存されるかは入力経路で変わる",
+   "content": "--value 'pa\\nss' は 5C 6E の 2 文字として保存され、--cli-input-json の \"pa\\nss\" は JSON デコードを経て実 LF 1 文字になる（実測 E-19）。前者は JCEKS を通るが store_credentials.sh の read が panss に潰す（実測 E-26）。後者は JCEKS で落ちる。",
+   "remedy": "意図を先に決め、登録直後に get-parameter して 16 進で照合する。"
+  }
+ ],
+ "matrix": {
+  "#": {
+   "A1": "OK",
+   "A2": "OK",
+   "A3": "△",
+   "S1": "OK",
+   "S2": "OK",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "OK",
+   "S6": "OK",
+   "S7": "△",
+   "S8": "OK"
+  },
+  "$": {
+   "A1": "△",
+   "A2": "OK",
+   "A3": "△",
+   "S1": "OK",
+   "S2": "OK",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "OK",
+   "S6": "OK",
+   "S7": "△",
+   "S8": "OK"
+  },
+  "^": {
+   "A1": "OK",
+   "A2": "OK",
+   "A3": "OK",
+   "S1": "OK",
+   "S2": "OK",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "OK",
+   "S6": "OK",
+   "S7": "OK",
+   "S8": "OK"
+  },
+  "!": {
+   "A1": "△",
+   "A2": "OK",
+   "A3": "OK",
+   "S1": "OK",
+   "S2": "OK",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "OK",
+   "S6": "OK",
+   "S7": "OK",
+   "S8": "OK"
+  },
+  "半角スペース": {
+   "A1": "△",
+   "A2": "OK",
+   "A3": "△",
+   "S1": "OK",
+   "S2": "OK",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "NG",
+   "S6": "OK",
+   "S7": "OK",
+   "S8": "OK"
+  },
+  "タブ": {
+   "A1": "△",
+   "A2": "△",
+   "A3": "△",
+   "S1": "OK",
+   "S2": "△",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "NG",
+   "S6": "OK",
+   "S7": "△",
+   "S8": "NG"
+  },
+  "実改行 LF（内部）": {
+   "A1": "OK",
+   "A2": "△",
+   "A3": "△",
+   "S1": "△",
+   "S2": "△",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "NG",
+   "S6": "OK",
+   "S7": "NG",
+   "S8": "NG"
+  },
+  "実改行 LF（末尾）": {
+   "A1": "OK",
+   "A2": "NG",
+   "A3": "NG",
+   "S1": "△",
+   "S2": "△",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "NG",
+   "S6": "OK",
+   "S7": "NG",
+   "S8": "NG"
+  },
+  "\\n（2 文字リテラル）": {
+   "A1": "△",
+   "A2": "OK",
+   "A3": "△",
+   "S1": "OK",
+   "S2": "OK",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "NG",
+   "S6": "OK",
+   "S7": "OK",
+   "S8": "OK"
+  },
+  "\\": {
+   "A1": "△",
+   "A2": "OK",
+   "A3": "△",
+   "S1": "OK",
+   "S2": "OK",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "NG",
+   "S6": "OK",
+   "S7": "OK",
+   "S8": "OK"
+  },
+  "|": {
+   "A1": "OK",
+   "A2": "OK",
+   "A3": "OK",
+   "S1": "OK",
+   "S2": "OK",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "OK",
+   "S6": "OK",
+   "S7": "OK",
+   "S8": "OK"
+  },
+  "${": {
+   "A1": "△",
+   "A2": "OK",
+   "A3": "△",
+   "S1": "OK",
+   "S2": "△",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "OK",
+   "S6": "OK",
+   "S7": "△",
+   "S8": "OK"
+  },
+  "${}": {
+   "A1": "△",
+   "A2": "OK",
+   "A3": "△",
+   "S1": "OK",
+   "S2": "△",
+   "S3": "OK",
+   "S4": "OK",
+   "S5": "OK",
+   "S6": "OK",
+   "S7": "△",
+   "S8": "OK"
+  }
+ },
+ "details": [
+  {
+   "char": "#",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "OK",
+   "phenomenon": "値はそのまま SecureString / SecretString として保存される。",
+   "rationale": "PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種のパターン制約が存在しない（実測 E-20）。AWS CLI は --value に対してエスケープ解釈を一切行わないため、シェルが渡したバイト列がそのままリクエストボディに載る（実測 E-19）。 # は CloudFormation・Terraform いずれの補間構文にも関与しない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "#",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "text / json いずれの出力でも変化しない。",
+   "rationale": "単一スカラに対する --output text は値をそのまま書き出し、末尾に LF を 1 個足すだけである。$( ) が除去するのはその末尾 LF のみで、値の内部は変化しない（実測 E-21 / E-23）。--output json は JSON エスケープするため情報を失わない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "#",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "△",
+   "phenomenon": "--env-file 経由にすると行頭の # がコメントとして破棄されうる。",
+   "rationale": "多くの .env パーサは行頭 # をコメントとして扱う。行中の # は値の一部として保持する実装が一般的だが差がある。S7 と同一の論点であり、発生箇所はこの受け渡し段である。",
+   "remedy": "--env-file を使わず、-e / ECS secrets / シークレットファイルの直渡しにする。"
+  },
+  {
+   "char": "#",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "値はバイト列としてそのまま環境変数に入る。",
+   "rationale": "BuildKit の env= はシークレットの内容をシェルを介さず直接 environ に設定するため、# が特別扱いされる経路が存在しない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "#",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "OK",
+   "phenomenon": "値が .cli ファイル本文に現れないため CLI のコメント構文に触れない。",
+   "rationale": "jboss-cli は行頭 # をコメントとして扱うが、base.cli に書かれているのは ${env.JBOSS_MASTER_PASSWORD} という式のみ。実値はサーバ側の式解決で注入されるため、CLI の字句解析を一度も通らない。XML・JCEKS でも # は非特殊。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "#",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "export VAR=${VAR} の展開結果に含まれる # はコメント開始にならない。",
+   "rationale": "シェルにおけるコメント認識はトークナイズ（字句解析）の段階で行われ、パラメータ展開はその後に実行される。展開結果が再度トークナイズされることはない。実測: 値 '#leading' が単一引数として保持されることを確認。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "#",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "ダブルクォート内のため確実に単一引数。",
+   "rationale": "同上。add-user は値を MD5 ハッシュ化して保存するため、properties ファイルのコメント構文にも触れない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "#",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "OK",
+   "phenomenon": "read・正規表現・$* のいずれでも # は変化しない。",
+   "rationale": "read は # を特別扱いしない。ERE において # はメタ文字ではない。$* の単語分割は IFS（既定で空白・タブ・改行）に基づくため # では分割されない。分割後の語が再トークナイズされることもないため、# はコメントにならない。実測で確認。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "#",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "eval の再パース対象はテキスト \"$@\" のみ。",
+   "rationale": "$@ の展開結果は再展開・再トークナイズされない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "#",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "△",
+   "phenomenon": "本コードでは問題ないが、値の受け渡し方法によっては欠落しうる。",
+   "rationale": "docker run --env-file および多くの .env パーサは行頭の # をコメントとして破棄する。行中の # は値の一部として保持される実装が一般的だが、実装差がある。",
+   "remedy": "--env-file を使わず -e / Docker secret / Kubernetes Secret を用いる。やむを得ず env-file を使う場合は先頭文字に # を置かない。"
+  },
+  {
+   "char": "#",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "印字可能 ASCII の範囲内 (0x20-0x7E) にあるため、SunJCE の PBE 鍵導出をそのまま通過する。（0x23）",
+   "rationale": "0x00-0xFF の全 256 文字を JCEKS の SecretKeyEntry 格納で走査したところ、受理されたのは 0x20-0x7E の 95 文字のみであった（OpenJDK 17.0.11 で実測。当該チェックは com.sun.crypto.provider.PBEKey にあり OpenJDK 21 でも同一）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "$",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "△",
+   "phenomenon": "CLI / API は素通しだが、IaC 経由で登録すると $ がテンプレート補間の起点になる。",
+   "rationale": "PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種のパターン制約が存在しない（実測 E-20）。AWS CLI は --value に対してエスケープ解釈を一切行わないため、シェルが渡したバイト列がそのままリクエストボディに載る（実測 E-19）。 ただし CloudFormation の Fn::Sub は ${...} を置換開始として扱い（リテラル化は ${!...}）、Terraform のテンプレート文字列も ${...} を補間する（リテラル化は $${...}）。シェルからダブルクォートで渡した場合も $ は変数展開される。",
+   "remedy": "実値を IaC テンプレートに書かない。CLI から渡すときは必ずシングルクォートで囲む。登録後に get-parameter して 16 進で照合する。"
+  },
+  {
+   "char": "$",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "出力整形は $ を特別扱いしない。",
+   "rationale": "単一スカラに対する --output text は値をそのまま書き出し、末尾に LF を 1 個足すだけである。$( ) が除去するのはその末尾 LF のみで、値の内部は変化しない（実測 E-21 / E-23）。--output json は JSON エスケープするため情報を失わない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "$",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "△",
+   "phenomenon": "compose / Kubernetes の値補間経路を通すと再解釈されうる。",
+   "rationale": "Kubernetes は Pod の env 値と command/args に含まれる $(VAR) を展開する（エスケープは $$(）。${...} 形式は展開しない。docker compose が補間するのは compose ファイル側であり、env_file の値は再補間されない。ECS の secrets 注入・-e・シークレットファイルでは再解釈は起きない。",
+   "remedy": "ECS secrets / -e / シークレットファイルの直渡しに寄せる。k8s を使う場合は値に $( を含めない。"
+  },
+  {
+   "char": "$",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "バイト列としてそのまま環境変数へ。",
+   "rationale": "シェル解釈が介在しない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "$",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "OK",
+   "phenomenon": "WildFly の式解決は解決結果を再走査しないため、値中の $ や ${ が再解釈されることはない。",
+   "rationale": "org.jboss.dmr.ValueExpression#resolveString は式文字列を左から走査し、${ を検出すると対応する } までを名前として解決し、解決結果を出力バッファへ追記したうえで走査位置を元文字列の } の直後へ進める。追記された解決結果が再びスキャンされることはない（非再帰）。したがって値が 'a${b}c' や 'a$$b' であっても、そのまま資格情報ストアのパスワードとして使われる。なお $$ は式リテラル側のエスケープ（→ $ 一文字）であり、base.cli 本文には $$ を書いていないため無関係。",
+   "remedy": "不要。ただし base.cli に実値を直書きする運用へ変えないこと。"
+  },
+  {
+   "char": "$",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "展開結果は再展開されない。",
+   "rationale": "POSIX シェルの展開は一度きりで、結果に対する再帰的なパラメータ展開は行われない。実測で確認。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "$",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "ダブルクォート内で単一引数として渡る。",
+   "rationale": "同上。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "$",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "OK",
+   "phenomenon": "read・[[ =~ ]]・$* のいずれでも $ は復活しない。",
+   "rationale": "read は入力を再展開しない。[[ ${line} =~ ... ]] の左辺は展開済み文字列であり、正規表現側の意味も持たない。$* の単語分割・パス名展開は行われるが、パラメータ展開の再実行は含まれない。実測: 値 'p$q' が BASH_REMATCH[2] に正しく格納されることを確認。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "$",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "eval を通っても値は再展開されない。",
+   "rationale": "eval \\\"$JAVA\\\" ... '\"$@\"' という定型では、eval が受け取る文字列中の \"$@\" が eval のパース時に展開され、各位置パラメータが個別の語になる。展開結果は再展開されないため、値中の $ ` \\ \" は保持される。これが add-user.sh / elytron-tool.sh で採用されている定石。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "$",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "△",
+   "phenomenon": "本コードでは問題ないが、環境変数を設定する側（コード外）で最も事故が多い文字。",
+   "rationale": "docker compose の YAML は environment 値に対して変数補間を行うため $ は $$ にエスケープしなければ消える。compose の .env も同様。Kubernetes の env[].value は $(VAR) 形式を展開するため $$( でのエスケープが必要。CI の秘密変数 UI でも展開されうる。",
+   "remedy": "値の受け渡しは Docker BuildKit secret / Kubernetes Secret の secretKeyRef / ファイルマウントに限定し、文字列補間される経路（compose の直書き、--env-file）を避ける。"
+  },
+  {
+   "char": "$",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "印字可能 ASCII の範囲内 (0x20-0x7E) にあるため、SunJCE の PBE 鍵導出をそのまま通過する。（0x24）",
+   "rationale": "0x00-0xFF の全 256 文字を JCEKS の SecretKeyEntry 格納で走査したところ、受理されたのは 0x20-0x7E の 95 文字のみであった（OpenJDK 17.0.11 で実測。当該チェックは com.sun.crypto.provider.PBEKey にあり OpenJDK 21 でも同一）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "OK",
+   "phenomenon": "そのまま保存される。",
+   "rationale": "PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種のパターン制約が存在しない（実測 E-20）。AWS CLI は --value に対してエスケープ解釈を一切行わないため、シェルが渡したバイト列がそのままリクエストボディに載る（実測 E-19）。 ^ は AWS / IaC いずれの補間構文でも特別な意味を持たない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "変化しない。",
+   "rationale": "単一スカラに対する --output text は値をそのまま書き出し、末尾に LF を 1 個足すだけである。$( ) が除去するのはその末尾 LF のみで、値の内部は変化しない（実測 E-21 / E-23）。--output json は JSON エスケープするため情報を失わない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "OK",
+   "phenomenon": "変化しない。",
+   "rationale": "printf '%s' で書いたシークレットファイルも、ECS の secrets 注入も、docker run -e も、値を再解釈しない。environ が格納できないのは NUL のみである。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "バイト列としてそのまま。",
+   "rationale": "シェル解釈なし。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "OK",
+   "phenomenon": "値が CLI 本文に現れず、WildFly 式構文・XML・JCEKS のいずれでも ^ は非特殊。",
+   "rationale": "式構文で意味を持つのは ${ } : $$ のみ。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "^ は POSIX シェルのメタ文字ではない。",
+   "rationale": "現行の sh/bash における ^ に特別な意味はない（初期 Bourne shell で | の別名だった歴史はあるが現行実装では非該当）。bash の ${var^} / ${var^^} は変数名側に付く大文字化構文であり、値の中の ^ とは無関係。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "変化なし。",
+   "rationale": "同上。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "OK",
+   "phenomenon": "正規表現の被検査文字列側にあるため、アンカーとしての意味を持たない。",
+   "rationale": "[[ ${line} =~ JBOSS_(.*_PASSWORD)=(.*) ]] において ^ がアンカーとして機能するのは右辺（パターン）に書かれた場合のみ。左辺は単なる被検査文字列である。実測: 値 'p^q' が正しくキャプチャされることを確認。IFS にも含まれないため $* でも分割されない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "変化なし。",
+   "rationale": "同上。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "^",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "OK",
+   "phenomenon": "変化なし。",
+   "rationale": "ただしコード外の注意として、Windows の cmd.exe はエスケープ文字が ^ であるため set JBOSS_MASTER_PASSWORD=a^b は 'ab' になる。PowerShell のエスケープはバッククォートであり ^ は影響しない。",
+   "remedy": "Windows から手動設定する場合のみ ^^ とするか PowerShell / WSL を用いる。"
+  },
+  {
+   "char": "^",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "印字可能 ASCII の範囲内 (0x20-0x7E) にあるため、SunJCE の PBE 鍵導出をそのまま通過する。（0x5E）",
+   "rationale": "0x00-0xFF の全 256 文字を JCEKS の SecretKeyEntry 格納で走査したところ、受理されたのは 0x20-0x7E の 95 文字のみであった（OpenJDK 17.0.11 で実測。当該チェックは com.sun.crypto.provider.PBEKey にあり OpenJDK 21 でも同一）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "!",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "△",
+   "phenomenon": "対話シェルから登録コマンドを打つと履歴展開が起きて別の値が保存される。",
+   "rationale": "履歴展開は対話シェル限定だが、パラメータストアへの登録はまさに対話シェルで手打ちされる作業である。ダブルクォート内でも履歴展開は抑止されない（シングルクォート内のみ抑止される）。AWS 側には何の制約も無いため（実測 E-20）、間違った値が黙って保存される。",
+   "remedy": "シングルクォートで囲む。もしくは set +H の後に実行する。登録後に get-parameter して 16 進で照合する。"
+  },
+  {
+   "char": "!",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "変化しない。",
+   "rationale": "単一スカラに対する --output text は値をそのまま書き出し、末尾に LF を 1 個足すだけである。$( ) が除去するのはその末尾 LF のみで、値の内部は変化しない（実測 E-21 / E-23）。--output json は JSON エスケープするため情報を失わない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "!",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "OK",
+   "phenomenon": "変化しない。",
+   "rationale": "printf '%s' で書いたシークレットファイルも、ECS の secrets 注入も、docker run -e も、値を再解釈しない。environ が格納できないのは NUL のみである。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "!",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "バイト列としてそのまま。",
+   "rationale": "シェル解釈なし。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "!",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "OK",
+   "phenomenon": "非特殊。",
+   "rationale": "式構文・XML・JCEKS いずれでも ! に意味はない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "!",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "履歴展開は非対話シェルでは無効。",
+   "rationale": "bash の履歴展開（histexpand, set -H）は対話シェルでのみ既定で有効。スクリプト実行such as bash script.sh は非対話であり、明示的に set -H しても履歴機構自体が無効なため展開は発生しない。実測で確認。さらに履歴展開は入力テキストに対する前処理であり、パラメータ展開の結果には適用されない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "!",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "変化なし。",
+   "rationale": "同上。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "!",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "OK",
+   "phenomenon": "read・正規表現・$* のいずれでも非特殊。",
+   "rationale": "ERE において ! はメタ文字ではない。[[ ! expr ]] の否定演算子は独立した語としての ! のみが該当し、文字列中の ! とは無関係。実測で確認。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "!",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "変化なし。",
+   "rationale": "同上。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "!",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "OK",
+   "phenomenon": "変化なし。",
+   "rationale": "コード外の注意として、対話 bash で export JBOSS_MASTER_PASSWORD=\"a!b\" と手打ちすると履歴展開が働き失敗またはコマンド化けを起こす。シングルクォートなら安全。",
+   "remedy": "手動設定時はシングルクォートを使う。"
+  },
+  {
+   "char": "!",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "印字可能 ASCII の範囲内 (0x20-0x7E) にあるため、SunJCE の PBE 鍵導出をそのまま通過する。（0x21）",
+   "rationale": "0x00-0xFF の全 256 文字を JCEKS の SecretKeyEntry 格納で走査したところ、受理されたのは 0x20-0x7E の 95 文字のみであった（OpenJDK 17.0.11 で実測。当該チェックは com.sun.crypto.provider.PBEKey にあり OpenJDK 21 でも同一）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "△",
+   "phenomenon": "先頭・末尾の半角スペースは画面上で判別できないまま保存される。",
+   "rationale": "PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種のパターン制約が存在しない（実測 E-20）。AWS CLI は --value に対してエスケープ解釈を一切行わないため、シェルが渡したバイト列がそのままリクエストボディに載る（実測 E-19）。 AWS は空白を保持するが、マネジメントコンソールのテキストエリアでも CLI の出力でも先頭・末尾の空白は目視できない。CI の入力欄や IaC の YAML スカラではトリムする実装がある。",
+   "remedy": "先頭・末尾に空白を置かない。登録直後に get-parameter の結果を od -c で確認する。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "末尾の空白も保持される。",
+   "rationale": "$( ) が除去するのは末尾の LF だけであり、空白は除去しない（実測 E-23）。--output text も空白を変更しない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "△",
+   "phenomenon": "--env-file 経由では行末空白の扱いが実装依存。",
+   "rationale": "行指向テキストを介する経路では、行末空白をトリムするパーサが存在する。シークレットファイル・ECS secrets・-e ではバイト列のまま渡る。",
+   "remedy": "--env-file を使わない。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "値はバイト列としてそのまま環境変数へ入る。",
+   "rationale": "BuildKit はシェルを介さず environ を設定するため、空白の有無はそのまま保持される。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "OK",
+   "phenomenon": "式のまま XML へ永続化されるため、XML の属性値正規化の影響を受けない。",
+   "rationale": "WildFly は clear-text が式許可属性であることから ${env.JBOSS_MASTER_PASSWORD} を ValueExpression として保持し、standalone.xml には式文字列のまま書き出す。解決はメモリ上で行われるため空白はそのまま JCEKS のパスワードとして使われる。式解決に trim 処理は存在しない。",
+   "remedy": "不要。ただし clear-text に実値を直書きする運用にすると XML 属性値正規化の影響を受けるため禁止。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "宣言コマンド規則により単語分割が発生しない。",
+   "rationale": "export は declaration utility であり、name=word 形式の引数はチルダ展開・パラメータ展開・コマンド置換・算術展開・クォート除去のみを受け、単語分割とパス名展開は行われない。実測: bash 5.3 / bash --posix / dash のいずれでも 'a b  c' がそのまま保持されることを確認。",
+   "remedy": "仕様依存であり脆い。export JBOSS_MASTER_PASSWORD=\"${JBOSS_MASTER_PASSWORD:?}\" と明示クォートすること。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "ダブルクォート済みで単一 argv として渡る。",
+   "rationale": "add-user はパスワードをハッシュ化して保存するため、空白が properties 構文に触れることもない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "NG",
+   "phenomenon": "(a) read の行末トリムで値末尾の空白が消える。(b) $* の単語分割で --secret の値が複数引数へ割れる。",
+   "rationale": "(a) read に IFS= 指定が無い場合、行の先頭および末尾の IFS 空白類が field splitting により除去される。printenv の出力は JBOSS_X_PASSWORD=<値> 形式なので値の先頭空白は行の途中に位置し保持されるが、値の末尾空白は行末にあたるため削除される。実測: 末尾 2 空白が消えることを確認。 (b) 関数内の $* は非クォートのため IFS で単語分割される。実測: --secret に 'my pass word' を渡すと --secret / my / pass / word の 4 語に分解され、elytron-tool は my を秘密値とみなし残りを不正な引数として扱う。 なおマスターパスワード自体は --password \"${JBOSS_MASTER_PASSWORD}\" とクォートされ、かつ grep -v によりループを通らないため、この 2 点の直接被害は受けない。被害を受けるのは JBOSS_ADMIN_PASSWORD 等ループ経由の秘密情報である。",
+   "remedy": "while IFS= read -r を用いる。関数の $* を \"$@\" に変更する。さらに printenv 依存をやめ compgen -e と間接展開 ${!name} に置換すれば、値がテキスト行を経由しなくなり本問題は根本的に消える。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "argv に空白を含めても eval では分割されない。",
+   "rationale": "\"$@\" 展開の結果は再トークナイズされない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "OK",
+   "phenomenon": "環境変数値としての空白は保持される。",
+   "rationale": "ただし --env-file や CI の変数入力欄では前後の空白がトリムされる実装があり、ビルド時と実行時で値が食い違う恐れがある。",
+   "remedy": "先頭・末尾の空白はポリシーで禁止するのが安全。"
+  },
+  {
+   "char": "半角スペース",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "印字可能 ASCII の範囲内 (0x20-0x7E) にあるため、SunJCE の PBE 鍵導出をそのまま通過する。（0x20）",
+   "rationale": "0x00-0xFF の全 256 文字を JCEKS の SecretKeyEntry 格納で走査したところ、受理されたのは 0x20-0x7E の 95 文字のみであった（OpenJDK 17.0.11 で実測。当該チェックは com.sun.crypto.provider.PBEKey にあり OpenJDK 21 でも同一）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "タブ",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "△",
+   "phenomenon": "コンソールからは入力できないことが多く、CLI 経由なら保存される。",
+   "rationale": "PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種のパターン制約が存在しない（実測 E-20）。AWS CLI は --value に対してエスケープ解釈を一切行わないため、シェルが渡したバイト列がそのままリクエストボディに載る（実測 E-19）。 ブラウザのテキストエリアでは Tab キーがフォーカス移動に割り当てられるため、コンソールからタブを含む値を入力するのは通常できない。一方 CLI から $'a\\tb' 等で渡せば何の警告もなく保存される。",
+   "remedy": "そもそも使わない。S8 で確実に落ちる（実測 E-17）。登録前に 0x20-0x7E の範囲チェックを行う。"
+  },
+  {
+   "char": "タブ",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "△",
+   "phenomenon": "複数形 API の text 出力では列境界と区別できない。",
+   "rationale": "get-parameters（複数形）の --output text はタブ区切り行形式で出力する（実測 E-22）。値にタブが含まれると列が増え、パース側は誤ったフィールドを読む。単数形 get-parameter + --query ならタブは保持される。",
+   "remedy": "複数形の text 出力を使わない。--output json + jq にする。"
+  },
+  {
+   "char": "タブ",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "△",
+   "phenomenon": "--env-file・CI 入力欄でスペースへ変換されることがある。",
+   "rationale": "行指向テキストや Web フォームを介する経路ではタブが空白へ正規化されたり除去されたりする実装がある。",
+   "remedy": "使わない。"
+  },
+  {
+   "char": "タブ",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "バイト列としてそのまま。",
+   "rationale": "S1 はシェル解釈を介さない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "タブ",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "△",
+   "phenomenon": "式のままであれば無害だが、実値を XML 属性に書くと空白へ変換される。",
+   "rationale": "XML 1.0 の属性値正規化（3.3.3 節）では、リテラルの TAB(#x9)・LF(#xA)・CR(#xD) は空白(#x20)に置換される。本コードは式を永続化するためこの経路には入らないが、--resolve-parameter-values の使用や clear-text への実値直書きを行うと、再読込時にタブが空白化してパスワードが変わる。",
+   "remedy": "式 ${env....} 方式を維持する。CLI で --resolve-parameter-values を使わない。"
+  },
+  {
+   "char": "タブ",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "宣言コマンド規則により分割されない。",
+   "rationale": "実測でタブを含む値が export 後も保持されることを確認。",
+   "remedy": "明示クォートを推奨。"
+  },
+  {
+   "char": "タブ",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "単一 argv として渡る。",
+   "rationale": "S4 はダブルクォート済み。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "タブ",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "NG",
+   "phenomenon": "空白と同一の IFS 要因により、行末タブの消失と $* の単語分割が発生する。",
+   "rationale": "既定 IFS は space・tab・newline であり、タブは空白と全く同じ扱いを受ける。実測: 値末尾のタブが read により失われることを od -c で確認。$* でもタブ位置で分割される。加えてタブは画面上不可視であるため、値が壊れても検知が極めて困難という運用上の悪性がある。",
+   "remedy": "空白と同じ修正（IFS= read -r / \"$@\" / compgen -e 方式）。加えてポリシーでタブを禁止することを強く推奨。"
+  },
+  {
+   "char": "タブ",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "argv 中のタブは保持される。",
+   "rationale": "\"$@\" は再トークナイズされない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "タブ",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "△",
+   "phenomenon": "受け渡し経路でタブが失われやすい。",
+   "rationale": ".env ファイル、Kubernetes マニフェストの YAML、CI の変数入力欄などでタブは空白へ変換されたり削除されたりする実装が多く、ビルド時と実行時の不一致を招く。",
+   "remedy": "タブは使用しない。"
+  },
+  {
+   "char": "タブ",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "NG",
+   "phenomenon": "JCEKS の秘密鍵エントリ格納が InvalidKeySpecException: Password is not ASCII で失敗する。",
+   "rationale": "タブは 0x09 であり、SunJCE の PBEWithMD5AndTripleDES 鍵導出が要求する印字可能 ASCII (0x20-0x7E) の範囲外。setEntry(SecretKeyEntry) の時点で例外となることを実測で切り分けた。一方、秘密鍵エントリを含まない空ストアの store()/load() はタブでも成功するため、base.cli の create=true によるストア作成自体はビルド時に通ってしまう。失敗は最初の add-alias まで遅延し、原因表示も Password is not ASCII とだけ出るため、タブが原因だと気づきにくい。",
+   "remedy": "シェル側の修正では回避不能。タブを禁止する以外に対処はない。起動前に 0x20-0x7E の範囲チェックを入れ、明示的なエラーメッセージで落とすこと。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "OK",
+   "phenomenon": "Enter で改行を入れても AWS は何の警告も出さずそのまま保存する。これが本問題の根源である。",
+   "rationale": "PutParameter の Value に文字種制約は存在せず（実測 E-20）、CLI も無解釈で送るため、0x0A がそのままリクエストボディに載ることを確認した（実測 E-19）。PEM 秘密鍵を SecureString に入れる用途が公式に想定されているとおり、複数行の値は仕様上正当である。つまり「登録できてしまう」ことこそが問題であり、AWS 側での事前検出は一切期待できない。",
+   "remedy": "put-parameter の前段に 0x20-0x7E の範囲チェックを置き、登録そのものを止める（第 6 章 0. put_master_password.sh）。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "△",
+   "phenomenon": "単数形なら保持されるが、複数形の text 出力を行パースすると値が切れて偽レコードが生まれる。",
+   "rationale": "get-parameters の --output text はタブ区切り行形式のため、値中の 0x0A がレコード区切りと区別できない。実測 E-22 では /a の値 'pa\\nss' が 'pa' に切り詰められ、さらに name='ss' という存在しないレコードが生成された。単数形 get-parameter + --query Parameter.Value + --output text なら内部 LF は保持される（実測 E-21）。",
+   "remedy": "複数形の text 出力を使わない。--output json + jq -j -r で取得する。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "△",
+   "phenomenon": "--env-file では表現できない。他の経路なら 0x0A のまま届いてしまう。",
+   "rationale": "environ が格納できないのは NUL のみで、LF は格納できる。したがって ECS secrets・-e・シークレットファイルでは LF はそのまま後段へ運ばれ、S5 のエイリアス注入（実測 E-08）と S8 の格納失敗（実測 E-17）に直結する。--env-file だけは行指向なので値が途中で切れる。",
+   "remedy": "どの経路を選んでも S8 で落ちる。A1 の段で登録を止めるのが唯一の解である。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "△",
+   "phenomenon": "シークレットファイル末尾の LF がそのまま値に混入する。",
+   "rationale": "BuildKit の --mount=type=secret,env=NAME はシークレットの内容をバイト列としてそのまま環境変数へ設定する。echo 'pw' > secret.txt のように生成すると値は pw+LF となる。ビルド時にはこの値で JCEKS が作成されるが、実行時に -e JBOSS_MASTER_PASSWORD=pw を渡すと一致せず、起動時に資格情報ストアを開けない。環境変数自体は LF を格納できる（格納できないのは NUL のみ）ため、エラーにならず静かに不一致となる点が悪質。",
+   "remedy": "シークレットは printf '%s' で末尾 LF なしに生成する。さらにビルド時に LF を含む値を検出して失敗させるアサートを入れる。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "△",
+   "phenomenon": "式のままなら保持されるが、実値を XML 属性へ書くと空白に潰れる。",
+   "rationale": "XML 属性値正規化により LF は空白へ変換される。本コードは式を永続化するため直接の被害はなく、資格情報ストアの作成も式解決後のメモリ上の値で行われるため LF はそのまま JCEKS のパスワードになる。しかし同じ値を system-property 等 XML 経由で永続化する箇所へ書くと空白化し、値が分岐して追跡困難な不整合を生む。",
+   "remedy": "LF を含むパスワードを許可しない。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "宣言コマンド規則により LF は保持される。",
+   "rationale": "実測: 改行を含む値が export 後も同一バイト列として保持されることを od -c で確認。",
+   "remedy": "明示クォートを推奨。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "argv に LF を含めることは可能で、そのまま JVM へ渡る。",
+   "rationale": "execve の引数は NUL 区切りであり、LF は通常のバイトとして扱われる。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "NG",
+   "phenomenon": "値の切り詰め・grep -v の素通り・資格情報ストアへのエイリアス注入という多段階の破綻が起きる。本分析における最悪の欠陥。",
+   "rationale": "(1) printenv の出力は行指向であり、LF を含む値は複数行に分裂する。 (2) grep -v JBOSS_MASTER_PASSWORD は JBOSS_MASTER_PASSWORD= を含む先頭行しか除去しない。値の 2 行目以降はそのままループへ流入する（マスターパスワード断片のログ露出リスク）。 (3) while read line は 1 行分しか読まないため、ループで処理される秘密情報は最初の LF で切り詰められる。 (4) 最も重大な点として、流入した後続行が JBOSS_(.*_PASSWORD)=(.*) に一致すると、任意のエイリアスを資格情報ストアへ登録・上書きできる。実測: JBOSS_MASTER_PASSWORD に Mast + LF + PART2 + LF + JBOSS_FAKE_PASSWORD=injected を設定したところ、alias=fake-password / secret=injected が追加対象として検出された。マスターパスワードの生成元が信頼できない場合、これは資格情報ストアへの注入経路となる。 (5) $* の IFS には LF が含まれるため、ここでも分割が起きる。",
+   "remedy": "printenv を廃し compgen -e（環境変数名の列挙。名前に LF は含まれ得ない）と間接展開 ${!name} を用いる。加えて CR/LF を含む秘密情報を検出したら即座に fail させるガードを入れる。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "argv 中の LF は保持される。",
+   "rationale": "\"$@\" は再トークナイズされない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "NG",
+   "phenomenon": "ビルド時と実行時で同一バイト列を渡し続けることが現実的に困難。",
+   "rationale": "docker run --env-file は 1 行 1 変数の形式であり LF を表現できない。docker compose の environment も同様。Kubernetes Secret の stringData なら表現可能だが、運用者が値を目視確認・再入力する過程で高確率で壊れる。ps 出力やログも壊れ、障害解析を著しく困難にする。",
+   "remedy": "LF・CR は例外なく禁止する。"
+  },
+  {
+   "char": "実改行 LF（内部）",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "NG",
+   "phenomenon": "JCEKS の秘密鍵エントリ格納が InvalidKeySpecException: Password is not ASCII で失敗する。",
+   "rationale": "改行は 0x0A であり印字可能 ASCII の範囲外。復帰 (0x0D) も同様に拒否される。タブと同じく空ストア作成は通り、最初のエイリアス登録で失敗する。シークレットファイル末尾の LF がそのまま環境変数に入る構成（EV-05）では、運用者が意図せずこの状態に陥る。",
+   "remedy": "シェル側の修正では回避不能。改行・復帰を禁止し、シークレット生成を printf '%s' に統一したうえで末尾 LF 除去と範囲チェックを行う。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "OK",
+   "phenomenon": "末尾で Enter を 1 回押しても、見た目が変わらないまま 0x0A が 1 バイト付いて保存される。",
+   "rationale": "PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種のパターン制約が存在しない（実測 E-20）。AWS CLI は --value に対してエスケープ解釈を一切行わないため、シェルが渡したバイト列がそのままリクエストボディに載る（実測 E-19）。 さらに --value file://pw.txt 形式ではファイルの中身が verbatim に送られるため、echo pass > pw.txt で作ったファイルは必ず末尾 LF 付きで登録される（実測 E-19 の 6 番）。printf '%s' pass > pw.txt なら末尾 LF は付かない（同 5 番）。",
+   "remedy": "シークレットファイルは printf '%s' で作る。登録前に 0x20-0x7E の範囲チェックを行う。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "NG",
+   "phenomenon": "PW=$(aws ... --output text) の結果から末尾 LF が無言で消える。",
+   "rationale": "--output text は値を出力したうえで必ず末尾に LF を 1 個足す（実測 E-21）。$( ) は末尾の LF を『すべて』除去する（実測 E-23）。したがって CLI が足した LF と値本来の末尾 LF を区別できず、末尾 LF ありの値と無しの値が同一の文字列になる。エラーも警告も出ないため、登録した値と起動時に使われる値が違うことに誰も気付かない。",
+   "remedy": "--output json で取得し jq -j -r（-j は末尾改行を出力しない）でファイルへ書く。取得直後に wc -c で登録時のバイト長と照合する。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "NG",
+   "phenomenon": "A2 の食い違いがそのまま固定される。リダイレクトで保存すると逆に 1 バイト増える。",
+   "rationale": "aws ... --output text > pw.txt はリダイレクトなので末尾 LF が削られず、CLI が足した LF がファイルに残る（実測 E-24）。printf '%s' \"$(aws ...)\" > pw.txt は逆に値本来の末尾 LF まで落とす。どちらも原値と一致しない。",
+   "remedy": "jq -j -r でファイルへ直接書き、od -c で末尾バイトを確認する。ビルド時と実行時で同一ファイルを配布する。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "△",
+   "phenomenon": "シークレットファイル末尾の LF がそのまま環境変数の値に入る。",
+   "rationale": "BuildKit の env= はファイルの生バイト列を environ へ設定する。B-04 / EV-05 と同一の罠であり、末尾 Enter で登録した値はこの罠を必ず踏む。",
+   "remedy": "シークレットは printf '%s' / jq -j -r で生成し、ビルド時に末尾 LF の不在をアサートする。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "△",
+   "phenomenon": "実値を standalone.xml へ書き出す運用にすると末尾 LF が空白 1 個へ正規化される。",
+   "rationale": "XML 1.0 の属性値正規化により、属性値中の 0x0A は 0x20 へ置換される（実測 E-29: 70 61 73 73 0A → 70 61 73 73 20）。現行の base.cli は式のまま永続化するため発生しないが、--resolve-parameter-values を付けると発生する。",
+   "remedy": "--resolve-parameter-values を使わない。実値を XML に書き出さない。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "export の展開では変化しない。",
+   "rationale": "export は宣言コマンドであり name=word は代入と同様に展開される。単語分割もパス名展開も起きない（実測 E-01）。",
+   "remedy": "不要。ただしクォートは付けること。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "ダブルクォート済みで単一引数として渡る。",
+   "rationale": "add-user は値を HEX(MD5(user:realm:pass)) にハッシュ化して保存するため、末尾 LF もハッシュ入力として扱われるだけで properties 構文には触れない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "NG",
+   "phenomenon": "printenv の行分割で末尾 LF が空行を生み、read が値を切り詰める。",
+   "rationale": "printenv は VAR=値 を行として出力するため、値末尾の LF はそのまま行末と重なって空行を生む。さらに read（IFS=・-r なし）は行末の空白類をトリムする（実測 E-02）。結果として末尾 LF は必ず失われる。",
+   "remedy": "printenv の行パースを廃し compgen -e + 間接展開 ${!name} へ置換する。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "eval の再パース対象はテキスト \"$@\" のみ。",
+   "rationale": "$@ の展開結果は再展開・再トークナイズされない（EV-06）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "NG",
+   "phenomenon": "ビルド時の値と実行時の値がバイト一致しない。",
+   "rationale": "A2 で末尾 LF が落ちた値でストアを作り、実行時に末尾 LF 付きの値で開こうとする（あるいはその逆）と、PBE 鍵が一致せず資格情報ストアを開けない。Elytron の初期化に失敗してサーバが起動しない。",
+   "remedy": "取得経路をビルド時・実行時で統一し、起動時に値のハッシュを突き合わせる。"
+  },
+  {
+   "char": "実改行 LF（末尾）",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "NG",
+   "phenomenon": "JCEKS が末尾 LF を含むパスワードを拒否する。",
+   "rationale": "SunJCE の PBE 鍵導出はパスワードを 0x20-0x7E に限定する。実測 E-17 で 'pass\\n'（70 61 73 73 0A）は InvalidKeySpecException: Password is not ASCII となった。CRLF（0D 0A）も同様。なお空ストア作成だけなら末尾 LF でも成功してしまう（実測 E-18）ため、失敗は最初のエイリアス登録まで遅延する。",
+   "remedy": "0x20-0x7E に限定する。末尾 LF は A1 の段で拒否する。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "△",
+   "phenomenon": "入力経路によって保存されるバイト列が 6 バイトにも 5 バイトにもなる。",
+   "rationale": "--value 'pa\\nss' は 70 61 5C 6E 73 73（バックスラッシュと n の 2 文字、改行ではない）として保存される。--cli-input-json '{\"Value\":\"pa\\nss\"}' は JSON デコードを経るため 70 61 0A 73 73（実 LF）になる。いずれも実測 E-19 で確認した。bash のダブルクォート \"pa\\nss\" も \\n を解釈しないため 2 文字のままである。つまり『改行のつもりで \\n と打った』人の意図と保存結果は、経路次第で食い違う。",
+   "remedy": "どちらの意図なのかを先に決める。改行を含めたいのであればそもそも禁止（S8 で落ちる）。2 文字として使うなら、登録直後に get-parameter して 16 進で 5C 6E を確認する。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "text / json いずれの出力でも 5C 6E のまま返る。",
+   "rationale": "--output text は 70 61 5C 6E 73 73 をそのまま出力し、--output json は \"pa\\\\nss\" と二重エスケープして出力する（実測 E-21）。jq -r で戻せば 5C 6E に復元される。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "△",
+   "phenomenon": "この段で echo -e / printf '%b' / dash の echo を通すと実 LF に化ける。",
+   "rationale": "実測 E-25: 値 pa\\nss に対し echo -e / printf '%b' / sh -c 'echo ...'（/bin/sh が dash・ash の場合）はいずれも 70 61 0A 73 73 を出力した。printf '%s' と bash の echo（-e なし）は 5C 6E を保つ。Secrets Manager に JSON で格納した値を jq -r で取り出す場合も、JSON の \\n は実 LF に展開される（実測 E-25）。UBI 9 の /bin/sh は bash なのでコンテナ内では化けないが、登録・配布側が Alpine や CI ランナーだと化ける。",
+   "remedy": "パスワードの受け渡しは printf '%s' に統一する。echo -e / printf '%b' を使わない。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "バイト列としてそのまま環境変数へ入る。",
+   "rationale": "BuildKit の env= はシェルを介さずシークレットの内容を environ へ設定する。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "OK",
+   "phenomenon": "値が .cli 本文に現れず、解決結果も再走査されない。",
+   "rationale": "実測 E-27: 値 pa\\nss を ${env.JBOSS_MASTER_PASSWORD} 経由で解決した結果は pa\\nss のままだった。ValueExpression はバックスラッシュを特別扱いしない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "export の展開では変化しない。",
+   "rationale": "展開結果は再展開されない（実測 E-01）。",
+   "remedy": "不要。ただしクォートは付けること。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "ダブルクォート済みで単一引数として渡る。",
+   "rationale": "値は MD5 ハッシュ化されて保存される。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "NG",
+   "phenomenon": "read（-r なし）がバックスラッシュを食い、panss という別の値になる。",
+   "rationale": "実測 E-26: 行 JBOSS_ADMIN_PASSWORD=pa\\nss を read（IFS=・-r なし）で読むと値は panss になった。IFS= read -r なら pa\\nss が保たれる。これは E-03 のバックスラッシュ破壊と同じ根だが、『改行のつもりで \\n と打つ』人が多いぶん踏む確率が高い。しかも資格情報ストアには panss が登録され、実行時の環境変数は pa\\nss のままなので、ストアは作られるのに開けないという切り分けの難しい壊れ方をする。",
+   "remedy": "IFS= read -r にする。根本的には compgen -e + 間接展開 ${!name} へ置換する。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "eval の再パース対象はテキスト \"$@\" のみ。",
+   "rationale": "$@ の展開結果は再展開されない（EV-06）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "OK",
+   "phenomenon": "standalone.xml には式が入るだけで、値は環境変数から解決される。",
+   "rationale": "実測 E-29: 仮に実値を XML 属性へ書いても 5C 6E は正規化されない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\n（2 文字リテラル）",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "5C と 6E はいずれも印字可能 ASCII の範囲内。",
+   "rationale": "実測 E-17: pa\\nss（70 61 5C 6E 73 73）は JCEKS へ格納・再オープンともに成功した（OpenJDK 21.0.10）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "△",
+   "phenomenon": "--cli-input-json 経由では \\\\ と二重に書かないと別の値になる。",
+   "rationale": "PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種のパターン制約が存在しない（実測 E-20）。AWS CLI は --value に対してエスケープ解釈を一切行わないため、シェルが渡したバイト列がそのままリクエストボディに載る（実測 E-19）。 ただし --cli-input-json は JSON デコードを行うため、\\ を 1 個だけ書くと \\u 等のエスケープとして解釈されるかパースエラーになる。実測 E-19 では \"pa\\\\nss\" が 5C 6E として正しく保存された。",
+   "remedy": "--value 形式をシングルクォートで使う。JSON 経由なら \\\\ と書く。登録後に 16 進で照合する。"
+  },
+  {
+   "char": "\\",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "text / json いずれの出力でも 5C は保たれる。",
+   "rationale": "単一スカラに対する --output text は値をそのまま書き出し、末尾に LF を 1 個足すだけである。$( ) が除去するのはその末尾 LF のみで、値の内部は変化しない（実測 E-21 / E-23）。--output json は JSON エスケープするため情報を失わない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "△",
+   "phenomenon": "echo -e / printf '%b' / dash の echo がバックスラッシュを解釈する。",
+   "rationale": "実測 E-25 と同じ経路。printf '%s' なら保たれる。",
+   "remedy": "パスワードの受け渡しは printf '%s' に統一する。"
+  },
+  {
+   "char": "\\",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "バイト列としてそのまま。",
+   "rationale": "S1 はシェル解釈を介さない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "OK",
+   "phenomenon": "WildFly の式構文にバックスラッシュエスケープは存在しない。",
+   "rationale": "式解決で意味を持つのは ${ } と : と $$ のみであり、バックスラッシュはそのまま値の一部として扱われる。XML 属性値でも非特殊。JCEKS のパスワードは char[] として扱われるため通常の文字。",
+   "remedy": "不要。ただし .cli 本文に実値を直書きする場合、jboss-cli のコマンド構文ではバックスラッシュがエスケープ文字となるため注意。"
+  },
+  {
+   "char": "\\",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "展開結果が再エスケープ解釈されることはない。",
+   "rationale": "パラメータ展開の結果に対してクォート除去やエスケープ処理が再適用されることはない。",
+   "remedy": "明示クォートを推奨。"
+  },
+  {
+   "char": "\\",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "ダブルクォート内で単一 argv として渡る。",
+   "rationale": "add-user はパスワードをハッシュ化して保存するため、properties ファイルのバックスラッシュエスケープ規則に値が触れることはない（ユーザ名側は影響を受けるが本件の対象外）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "NG",
+   "phenomenon": "read に -r が無いためバックスラッシュがエスケープとして消費される。",
+   "rationale": "(1) read は -r を付けない場合、バックスラッシュを次の文字のエスケープとして解釈し、バックスラッシュ自体を除去する。実測: JBOSS_ADMIN_PASSWORD=pa\\ss\\\\word が JBOSS_ADMIN_PASSWORD=password に化けることを確認。 (2) さらに行末のバックスラッシュは行継続とみなされ、次の行と連結される。実測: JBOSS_A_PASSWORD=end\\ と JBOSS_B_PASSWORD=next が 1 行に連結され、両方の秘密情報が同時に破壊されることを確認。 (3) $* での単語分割自体はバックスラッシュを分割対象としないため、破壊要因は read に限定される。 マスターパスワードはループを通らないため直接の被害は受けないが、JBOSS_ADMIN_PASSWORD 等が壊れる。",
+   "remedy": "while IFS= read -r を用いる。根本的には compgen -e と ${!name} 方式へ置換し、値をテキスト行として読まない設計にする。"
+  },
+  {
+   "char": "\\",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "eval を通ってもバックスラッシュは再解釈されない。",
+   "rationale": "eval が再パースするのはテキスト \"$@\" であり、その展開結果は再パースされない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "\\",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "OK",
+   "phenomenon": "環境変数値としてそのまま保持される。",
+   "rationale": "コード外の注意として、Windows の PowerShell/cmd から設定する場合や JSON/YAML を経由する場合はエスケープ規則に従う必要がある。",
+   "remedy": "受け渡し経路のエスケープ規則に注意する。"
+  },
+  {
+   "char": "\\",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "印字可能 ASCII の範囲内 (0x20-0x7E) にあるため、SunJCE の PBE 鍵導出をそのまま通過する。（0x5C）",
+   "rationale": "0x00-0xFF の全 256 文字を JCEKS の SecretKeyEntry 格納で走査したところ、受理されたのは 0x20-0x7E の 95 文字のみであった（OpenJDK 17.0.11 で実測。当該チェックは com.sun.crypto.provider.PBEKey にあり OpenJDK 21 でも同一）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "|",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "OK",
+   "phenomenon": "そのまま保存される。",
+   "rationale": "PutParameter の Value と CreateSecret の SecretString はサービスモデル上 min/max しか持たず、文字種のパターン制約が存在しない（実測 E-20）。AWS CLI は --value に対してエスケープ解釈を一切行わないため、シェルが渡したバイト列がそのままリクエストボディに載る（実測 E-19）。 | が問題になるのは CLI 起動時のクォート漏れだけで、これは全記号に共通する前提である。",
+   "remedy": "不要（値はシングルクォートで囲む）。"
+  },
+  {
+   "char": "|",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "変化しない。",
+   "rationale": "単一スカラに対する --output text は値をそのまま書き出し、末尾に LF を 1 個足すだけである。$( ) が除去するのはその末尾 LF のみで、値の内部は変化しない（実測 E-21 / E-23）。--output json は JSON エスケープするため情報を失わない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "|",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "OK",
+   "phenomenon": "変化しない。",
+   "rationale": "printf '%s' で書いたシークレットファイルも、ECS の secrets 注入も、docker run -e も、値を再解釈しない。environ が格納できないのは NUL のみである。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "|",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "バイト列としてそのまま。",
+   "rationale": "S1 はシェル解釈を介さない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "|",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "OK",
+   "phenomenon": "式構文・XML・JCEKS いずれでも非特殊。",
+   "rationale": "値が CLI 本文に現れないため、jboss-cli の字句解析も通らない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "|",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "パイプ記号は演算子としてトークナイズ時にのみ認識される。",
+   "rationale": "シェルの制御演算子はコマンド行の字句解析時に決定され、パラメータ展開の結果が再度トークナイズされることはない。したがって展開結果に含まれるパイプ記号は常にデータである。",
+   "remedy": "明示クォートを推奨。"
+  },
+  {
+   "char": "|",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "単一 argv として渡る。",
+   "rationale": "S4 はダブルクォート済み。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "|",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "OK",
+   "phenomenon": "read・正規表現・$* のいずれでもパイプ記号は変化しない。",
+   "rationale": "read はパイプ記号を特別扱いしない。ERE のパイプ記号は選択（alternation）メタ文字だが、それはパターン側での意味であり、被検査文字列である ${line} 側では通常の文字。$* の単語分割は IFS に基づくためパイプ記号では分割されず、分割後の語が再トークナイズされないためパイプ演算子になることもない。実測: 値 p|q が正しくキャプチャされ、$* 経由でも単一引数のまま保持されることを確認。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "|",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "eval を通っても再解釈されない。",
+   "rationale": "\"$@\" の展開結果は再パースされない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "|",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "OK",
+   "phenomenon": "変化なし。",
+   "rationale": "受け渡し経路でもパイプ記号が問題になる実装は通常存在しない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "|",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "印字可能 ASCII の範囲内 (0x20-0x7E) にあるため、SunJCE の PBE 鍵導出をそのまま通過する。（0x7C）",
+   "rationale": "0x00-0xFF の全 256 文字を JCEKS の SecretKeyEntry 格納で走査したところ、受理されたのは 0x20-0x7E の 95 文字のみであった（OpenJDK 17.0.11 で実測。当該チェックは com.sun.crypto.provider.PBEKey にあり OpenJDK 21 でも同一）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "△",
+   "phenomenon": "AWS CLI / API は素通しだが、IaC 経由で登録すると ${ がテンプレート構文の開始になる。",
+   "rationale": "実測 E-19: --value 'pa${ss' は 70 61 24 7B 73 73 としてそのまま保存された。一方 CloudFormation の Fn::Sub は ${ を置換開始として扱い（リテラル化は ${!）、Terraform のテンプレート文字列も ${ を補間として扱う（リテラル化は $${）。シェルからダブルクォートで \"pa${ss\" と渡すと bash が不正な変数展開としてエラーにする。",
+   "remedy": "シングルクォートで囲んで CLI から登録する。実値を IaC テンプレートに書かない。"
+  },
+  {
+   "char": "${",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "出力整形は ${ を特別扱いしない。",
+   "rationale": "実測 E-21: text / json いずれも 24 7B をそのまま返した。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "△",
+   "phenomenon": "compose / Kubernetes の値補間経路を通すと再解釈されうる。",
+   "rationale": "Kubernetes が env 値で展開するのは $(VAR) 形式のみで ${...} は展開しないため、k8s では無害。docker compose が補間するのは compose ファイル側であり、ECS secrets・-e・シークレットファイルでは再解釈は起きない。",
+   "remedy": "直渡しの経路に寄せる。"
+  },
+  {
+   "char": "${",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "バイト列としてそのまま環境変数へ入る。",
+   "rationale": "BuildKit の env= はシェルを介さない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "△",
+   "phenomenon": "現行の式方式では完全に無害。実値を直書きした瞬間に起動不能になる。",
+   "rationale": "実測 E-27: 値 pa${ss を ${env.JBOSS_MASTER_PASSWORD} 経由で解決した結果は pa${ss のままだった。org.jboss.dmr.ValueExpression#resolveString は解決結果を出力バッファへ追記したうえで走査位置を元文字列の } の直後へ進めるため、追記された解決結果が再スキャンされることはない。一方 実測 E-28: 同じ文字列を『式そのもの』として評価すると IllegalStateException: Incomplete expression: pa を送出した。--resolve-parameter-values 付きの jboss-cli 実行、add-alias(secret-value=\"実値\") のような直書き、standalone.xml への実値書き出しがこれに該当する。",
+   "remedy": "base.cli に実値を直書きしない。--resolve-parameter-values を使わない。やむを得ず直書きする場合は $ を $$ にエスケープする（実測 E-28: pa$${ss → pa${ss）。"
+  },
+  {
+   "char": "${",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "export の展開では変化しない。",
+   "rationale": "展開結果は再展開されない（実測 E-01）。",
+   "remedy": "不要。ただしクォートは付けること。"
+  },
+  {
+   "char": "${",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "ダブルクォート済みで単一引数として渡る。",
+   "rationale": "値は MD5 ハッシュ化されて保存される。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "OK",
+   "phenomenon": "read・正規表現・$* のいずれでも変化しない。",
+   "rationale": "実測 E-26: 値 pa${ss は read / IFS= read -r / [[ =~ ]] のキャプチャ / $* の単語分割のすべてを無変化で通過した。${ はシェルにとって展開開始を示すが、それはトークナイズ時の話であり、展開結果の中の ${ は再展開されない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "eval の再パース対象はテキスト \"$@\" のみ。",
+   "rationale": "$@ の展開結果は再展開されない（EV-06）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "△",
+   "phenomenon": "standalone.xml に保持されるのは式であって実値ではないため現状は安全。",
+   "rationale": "実行時に解決されるのは ${env.JBOSS_MASTER_PASSWORD} であり、その解決結果は再走査されない（実測 E-27）。実値が XML に書き込まれる運用へ変わると、起動時の式解決で Incomplete expression となりサーバが起動しない。なお XML 属性値正規化は ${ を変更しない（実測 E-29）。",
+   "remedy": "standalone.xml に実値を書き出さない運用を維持する。"
+  },
+  {
+   "char": "${",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "24 と 7B はいずれも印字可能 ASCII の範囲内。",
+   "rationale": "実測 E-17: pa${ss（70 61 24 7B 73 73）は JCEKS へ格納・再オープンともに成功した（OpenJDK 21.0.10）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${}",
+   "stage": "A1 パラメータストアへの登録",
+   "verdict": "△",
+   "phenomenon": "AWS CLI / API は素通しだが、IaC 経由では ${} が補間構文になる。",
+   "rationale": "実測 E-19: --value 'pa${}ss' は 70 61 24 7B 7D 73 73 としてそのまま保存された。IaC 側の注意点は ${ と同じ。",
+   "remedy": "シングルクォートで囲んで CLI から登録する。実値を IaC テンプレートに書かない。"
+  },
+  {
+   "char": "${}",
+   "stage": "A2 パラメータストアからの取得",
+   "verdict": "OK",
+   "phenomenon": "出力整形は ${} を特別扱いしない。",
+   "rationale": "実測 E-21: text / json いずれも 24 7B 7D をそのまま返した。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${}",
+   "stage": "A3 取得値のコンテナへの受け渡し",
+   "verdict": "△",
+   "phenomenon": "compose / Kubernetes の値補間経路を通すと再解釈されうる。",
+   "rationale": "Kubernetes が展開するのは $(VAR) 形式のみなので k8s では無害。ECS secrets・-e・シークレットファイルでは再解釈は起きない。",
+   "remedy": "直渡しの経路に寄せる。"
+  },
+  {
+   "char": "${}",
+   "stage": "S1 BuildKit シークレット → 環境変数",
+   "verdict": "OK",
+   "phenomenon": "バイト列としてそのまま環境変数へ入る。",
+   "rationale": "BuildKit の env= はシェルを介さない。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${}",
+   "stage": "S2 base.cli の式解決（WildFly ExpressionResolver）",
+   "verdict": "△",
+   "phenomenon": "現行の式方式では完全に無害。実値を直書きした瞬間に起動不能になる。",
+   "rationale": "実測 E-27: 値 pa${}ss を ${env.JBOSS_MASTER_PASSWORD} 経由で解決した結果は pa${}ss のままだった（解決結果は再走査されない）。一方 実測 E-28: 同じ文字列を式として評価すると IllegalArgumentException: key can't be empty を送出した。${} 単独でも同じ例外になる。${ の Incomplete expression とは例外の種類が異なるだけで、起動不能という結果は同じである。",
+   "remedy": "base.cli に実値を直書きしない。--resolve-parameter-values を使わない。やむを得ず直書きする場合は $$ でエスケープする（$${} と書けば ${} 1 個に解決される）。"
+  },
+  {
+   "char": "${}",
+   "stage": "S3 base-env.sh での再 export",
+   "verdict": "OK",
+   "phenomenon": "export の展開では変化しない。",
+   "rationale": "展開結果は再展開されない（実測 E-01）。",
+   "remedy": "不要。ただしクォートは付けること。"
+  },
+  {
+   "char": "${}",
+   "stage": "S4 create-admin-user.sh",
+   "verdict": "OK",
+   "phenomenon": "ダブルクォート済みで単一引数として渡る。",
+   "rationale": "値は MD5 ハッシュ化されて保存される。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${}",
+   "stage": "S5 store_credentials.sh",
+   "verdict": "OK",
+   "phenomenon": "read・正規表現・$* のいずれでも変化しない。",
+   "rationale": "実測 E-26: 値 pa${}ss は read / IFS= read -r / [[ =~ ]] のキャプチャ / $* の単語分割のすべてを無変化で通過した。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${}",
+   "stage": "S6 ランチャスクリプト（elytron-tool.sh / add-user.sh）",
+   "verdict": "OK",
+   "phenomenon": "eval の再パース対象はテキスト \"$@\" のみ。",
+   "rationale": "$@ の展開結果は再展開されない（EV-06）。",
+   "remedy": "不要。"
+  },
+  {
+   "char": "${}",
+   "stage": "S7 実行時 standalone.sh",
+   "verdict": "△",
+   "phenomenon": "standalone.xml に保持されるのは式であって実値ではないため現状は安全。",
+   "rationale": "実値が XML に書き込まれる運用へ変わると、起動時の式解決で key can't be empty となりサーバが起動しない。XML 属性値正規化は ${} を変更しない（実測 E-29）。",
+   "remedy": "standalone.xml に実値を書き出さない運用を維持する。"
+  },
+  {
+   "char": "${}",
+   "stage": "S8 資格情報ストア実体（JCEKS + SunJCE PBE）",
+   "verdict": "OK",
+   "phenomenon": "24 7B 7D はいずれも印字可能 ASCII の範囲内。",
+   "rationale": "実測 E-17: pa${}ss（70 61 24 7B 7D 73 73）は JCEKS へ格納・再オープンともに成功した（OpenJDK 21.0.10）。",
+   "remedy": "不要。"
+  }
+ ],
+ "defects": [
+  {
+   "id": "B-01",
+   "severity": "致命",
+   "place": "1. Dockerfile",
+   "code": "RUN --mount=type=secret, id=jboss_master_password, env=...",
+   "content": "BuildKit の --mount は CSV 形式で解析される。カンマ直後の空白がキー名の一部となり、未知のキーとして拒否される。",
+   "impact": "docker build が失敗する。",
+   "remedy": "空白を除去し RUN --mount=type=secret,id=jboss_master_password,env=JBOSS_MASTER_PASSWORD,required=true \\ とする。"
+  },
+  {
+   "id": "B-02",
+   "severity": "重大",
+   "place": "5. store_credentials.sh",
+   "code": "printenv | grep -v JBOSS_MASTER_PASSWORD | while read line",
+   "content": "秘密情報を行指向テキストとして再パースしている。LF 混入時の切り詰め・素通り・エイリアス注入、バックスラッシュのエスケープ消費、行末空白/タブのトリムがすべてここに集約されている。",
+   "impact": "改行を含むマスターパスワードで資格情報ストアへの任意エイリアス注入が成立する（実測で再現）。",
+   "remedy": "compgen -e による変数名列挙と ${!name} の間接展開に置換する。"
+  },
+  {
+   "id": "B-03",
+   "severity": "重大",
+   "place": "5. store_credentials.sh / 4. create-admin-user.sh",
+   "code": "--password \"${JBOSS_MASTER_PASSWORD}\" / add-user.sh ... \"${JBOSS_ADMIN_PASSWORD}\"",
+   "content": "パスワードがコマンドライン引数に載る。",
+   "impact": "同一 PID 名前空間の任意プロセスが ps -ef および /proc/<pid>/cmdline から平文を読める。コンテナ内で複数プロセスが動く構成では実害となる。",
+   "remedy": "jboss-cli の credential-store=EAPCS:add-alias(alias=..., secret-value=\"${env.JBOSS_ADMIN_PASSWORD}\") 方式へ寄せ、argv からパスワードを排除する。base.cli が既にこの方式を採っているので設計の一貫性も向上する。"
+  },
+  {
+   "id": "B-04",
+   "severity": "重大",
+   "place": "1. Dockerfile / 6. entrypoint.sh",
+   "code": "ビルド時の JCEKS 作成と実行時の JCEKS オープン",
+   "content": "BuildKit の env= はシークレットファイルの生バイト列を渡すため末尾 LF が混入しうる。実行時に別経路で渡した値と 1 バイトでも異なると一致しない。",
+   "impact": "起動時に資格情報ストアを開けず、Elytron の初期化に失敗してサーバが起動しない。原因表示が不親切で切り分けが困難。",
+   "remedy": "シークレットを printf '%s' で生成し、ビルド時と起動時の両方で CR/LF を検出して即 fail するアサートを置く。"
+  },
+  {
+   "id": "B-05",
+   "severity": "中",
+   "place": "5. store_credentials.sh",
+   "code": "grep -v JBOSS_MASTER_PASSWORD",
+   "content": "部分一致による除外。",
+   "impact": "JBOSS_MASTER_PASSWORD_FILE のような別変数の行も落ちる。逆に、値の中にその文字列を含む無関係な変数の行も落ちる。",
+   "remedy": "そもそも除外はループ内の名前完全一致判定で行う。"
+  },
+  {
+   "id": "B-06",
+   "severity": "中",
+   "place": "5. store_credentials.sh",
+   "code": "[[ ${line} =~ JBOSS_(.*_PASSWORD)=(.*) ]]",
+   "content": "正規表現が未アンカーかつ .* が貪欲。",
+   "impact": "MY_JBOSS_ADMIN_PASSWORD のような無関係な変数も一致する（実測で再現）。値に _PASSWORD= が含まれるとキャプチャ境界がずれ、エイリアス名と秘密値が両方壊れる（実測で再現）。",
+   "remedy": "変数名の完全一致（case \"$name\" in JBOSS_*_PASSWORD) ）で判定する。"
+  },
+  {
+   "id": "B-07",
+   "severity": "中",
+   "place": "6. entrypoint.sh",
+   "code": "store_credentials.sh を 2 回実行している",
+   "content": "run-config-scripts.sh で 1 回、configuration-seed のコピー後にもう 1 回実行される。スクリプト冒頭に rm -f ${CREDENTIAL_STORE} があるため 1 回目の成果は破棄される。",
+   "impact": "無駄な処理であり、1 回目と 2 回目で環境が異なると挙動が非決定的になる。",
+   "remedy": "seed コピー後の 1 回に集約する。"
+  },
+  {
+   "id": "B-08",
+   "severity": "中",
+   "place": "6. entrypoint.sh",
+   "code": "install -m 0644 \\ の後の 2 行に継続行 \\ が無い",
+   "content": "行継続が途切れているため install はコピー元のみを引数に取り、次行が独立したコマンドとして実行される。",
+   "impact": "install がエラーになるか、war ファイルが配備されない。",
+   "remedy": "各行末に \\ を付ける。"
+  },
+  {
+   "id": "B-09",
+   "severity": "中",
+   "place": "6. entrypoint.sh",
+   "code": "-c \"standalone.xml\" の後に \\ が無く ${JBOSS_SERVER_OPTS} が別行",
+   "content": "exec のコマンドラインが -c standalone.xml で終端し、${JBOSS_SERVER_OPTS} が別コマンドとして解釈される。",
+   "impact": "サーバオプションが一切渡らない。exec 済みなので後続行に到達しないケースもある。",
+   "remedy": "-c \"standalone.xml\" \\ と継続し、${JBOSS_SERVER_OPTS} も分割意図があるなら配列化する。"
+  },
+  {
+   "id": "B-10",
+   "severity": "低",
+   "place": "6. run_config_scripts.sh / entrypoint.sh",
+   "code": "run_config_scripts.sh / run-config-scripts.sh / funconfig-scripts.sh",
+   "content": "ファイル名の表記が 3 通りに揺れている。",
+   "impact": "存在しないパスを叩いて no such file になる。",
+   "remedy": "名称を一本化する。"
+  },
+  {
+   "id": "B-11",
+   "severity": "低",
+   "place": "2. base.cli",
+   "code": "embed-server が無い",
+   "content": "ビルド時（サーバ未起動）に jboss-cli.sh --file を実行するには先頭に embed-server、末尾に stop-embedded-server が必要。",
+   "impact": "コントローラに接続できず CLI が失敗する。",
+   "remedy": "embed-server --server-config=standalone.xml --std-out=echo を先頭に置く。"
+  },
+  {
+   "id": "B-12",
+   "severity": "低",
+   "place": "5. store_credentials.sh / 6. run_config_scripts.sh",
+   "code": "パイプライン中の while ループ",
+   "content": "パイプの右辺はサブシェルで実行されるため、ループ内の変数変更や exit が親シェルへ伝播しない。set -e も期待どおり働かない。",
+   "impact": "登録失敗を検知できず、壊れた資格情報ストアのまま起動が続行される。",
+   "remedy": "プロセス置換 done < <(...) を使うか、明示的に終了コードを集約する。"
+  },
+  {
+   "id": "B-13",
+   "severity": "低",
+   "place": "5. store_credentials.sh",
+   "code": "変数名 alias",
+   "content": "alias はシェル組み込みコマンド名と同名。変数としては合法だが可読性を損なう。",
+   "impact": "実害は無いが誤読を招く。",
+   "remedy": "cs_alias 等へ改名する。"
+  },
+  {
+   "id": "B-14",
+   "severity": "低",
+   "place": "5. store_credentials.sh",
+   "code": "echo \"jboss_credential_store()... Adding alias: admin-password\"",
+   "content": "実際に登録したエイリアス名に関わらず admin-password と固定出力している。しかも呼び出し後ではなく関数内の末尾にある。",
+   "impact": "ログが実態と乖離し、障害解析を誤らせる。",
+   "remedy": "登録した実エイリアス名を出力する。"
+  },
+  {
+   "id": "B-15",
+   "severity": "低",
+   "place": "3. base-env.sh",
+   "code": "export JBOSS_MASTER_PASSWORD=${JBOSS_MASTER_PASSWORD}",
+   "content": "未設定時に空文字で export されるため、未設定と空文字の区別が失われる。",
+   "impact": "後段が空パスワードで JCEKS を作成/オープンしようとして不可解なエラーになる。",
+   "remedy": ":\"${JBOSS_MASTER_PASSWORD:?...}\" で必須チェックしてから export する。"
+  },
+  {
+   "id": "B-16",
+   "severity": "低",
+   "place": "5. store_credentials.sh 1 行目",
+   "code": "echo \"startup shell executing ... startup/create-credentials.sh\"",
+   "content": "ログ文言のファイル名が create-credentials.sh となっているが、実体は store_credentials.sh。構文は正しく、実行に支障はない。",
+   "impact": "起動ログとファイル名が対応せず、障害解析時に追跡先を誤らせる。",
+   "remedy": "echo \"startup shell executing ... startup/store_credentials.sh\" とする。"
+  },
+  {
+   "id": "B-17",
+   "severity": "重大",
+   "place": "1. Dockerfile",
+   "code": "# syntax ディレクティブが無い",
+   "content": "RUN --mount の env= オプションは Dockerfile frontend v1.10.0 以降でのみ有効。syntax 宣言が無いと既定 frontend のバージョンに依存する。",
+   "impact": "frontend が古いと env= が解釈されず JBOSS_MASTER_PASSWORD が設定されない。",
+   "remedy": "ファイル先頭に # syntax=docker/dockerfile:1.10 を明記する。"
+  },
+  {
+   "id": "B-18",
+   "severity": "重大",
+   "place": "1. Dockerfile（podman / buildah でビルドする場合）",
+   "code": "--mount=type=secret,env= の宛先指定",
+   "content": "podman の --secret における env= は「値の読み取り元のホスト環境変数」を指すソース指定であり、podman-build のドキュメントは RUN --mount=type=secret の宛先オプションとして id と target のみを挙げている。",
+   "impact": "podman でビルドすると env= が機能せず、シークレットはファイルとしてのみマウントされる可能性がある。",
+   "remedy": "ビルドツールを確定する。podman を使うなら /run/secrets/<id> から読み、末尾 LF を除去する。"
+  },
+  {
+   "id": "B-19",
+   "severity": "重大",
+   "place": "2. base.cli / 5. store_credentials.sh",
+   "code": "パスワードの文字種チェックが無い",
+   "content": "JCEKS が受理するのは 0x20-0x7E のみだが、どこにも検証が無い。しかも空ストア作成は成功するため、失敗が最初のエイリアス登録まで遅延する。",
+   "impact": "ビルドは成功し起動時に Password is not ASCII で落ちる。原因の切り分けが困難。",
+   "remedy": "ビルド時と起動時の両方で 0x20-0x7E の範囲チェックを行い、明示的なメッセージで落とす。"
+  },
+  {
+   "id": "B-20",
+   "severity": "重大",
+   "place": "A2 パラメータストアからの取得",
+   "code": "PW=$(aws ssm get-parameter ... --query Parameter.Value --output text)",
+   "content": "--output text が足す末尾 LF と、値本来の末尾 LF を $( ) が区別せずまとめて除去する（実測 E-21 / E-23）。",
+   "impact": "末尾に Enter を含むパスワードを登録すると、登録値と起動時の値が無言で食い違う。ビルド時に作った資格情報ストアを実行時に開けず、原因表示も出ない。",
+   "remedy": "--output json + jq -j -r でファイルへ直接書き出す。取得後に wc -c で登録時のバイト長と照合する。"
+  },
+  {
+   "id": "B-21",
+   "severity": "重大",
+   "place": "A1 パラメータストアへの登録",
+   "code": "aws ssm put-parameter --value 'pa\\nss' / --cli-input-json '{\"Value\":\"pa\\nss\"}'",
+   "content": "入力経路ごとにエスケープ解釈が異なる。--value は無解釈、--cli-input-json は JSON デコード、コンソールのテキストエリアは生テキスト（Enter が実 LF）。",
+   "impact": "『改行のつもりで \\n と打った』意図と保存結果が食い違う。2 文字のままなら S5 で panss に化け、実 LF なら S8 で落ちる。どちらに転んでも壊れる。",
+   "remedy": "登録は 1 つの経路（--value file://）に統一し、登録直後に get-parameter して 16 進で照合する。"
+  },
+  {
+   "id": "B-22",
+   "severity": "重大",
+   "place": "A1 パラメータストアへの登録",
+   "code": "Value / SecretString に文字種のパターン制約が無い",
+   "content": "AWS 側に検証が一切ないため、JCEKS が受理しない値でも登録は成功する（実測 E-20）。PEM 秘密鍵の格納が正当な用途である以上、この挙動が変わることはない。",
+   "impact": "登録者は成功したと認識し、失敗は数十分後のビルドまたは起動まで遅延する。切り分けが最も難しい失敗の仕方をする。",
+   "remedy": "登録スクリプト側で 0x20-0x7E の範囲チェックを行い、登録を拒否する（第 6 章 0.）。"
+  },
+  {
+   "id": "B-23",
+   "severity": "中",
+   "place": "A2 パラメータストアからの取得",
+   "code": "aws ssm get-parameters --names ... --output text",
+   "content": "複数形 API の text 出力はタブ区切り行形式。値に LF・タブが含まれると行・列の境界と区別できない。",
+   "impact": "実測 E-22 では値 pa<LF>ss が pa に切り詰められ、さらに name=ss という存在しないレコードが生成された。誤ったエイリアスが資格情報ストアへ登録されうる。",
+   "remedy": "複数形の text 出力を使わない。--output json + jq にする。"
+  },
+  {
+   "id": "B-24",
+   "severity": "中",
+   "place": "A3 取得値のコンテナへの受け渡し",
+   "code": "aws ... --output text > pw.txt / printf '%s' \"$(aws ...)\" > pw.txt",
+   "content": "前者は CLI が足した LF が残り原値より 1 バイト多くなる。後者は値本来の末尾 LF まで落とす（実測 E-24）。",
+   "impact": "どちらもビルド時と実行時でバイト列が食い違い、B-04 と同じ起動不能を招く。",
+   "remedy": "jq -j -r でファイルへ直接書き、od -c で末尾バイトを確認する。"
+  },
+  {
+   "id": "B-25",
+   "severity": "中",
+   "place": "A3 取得値のコンテナへの受け渡し",
+   "code": "docker run --env-file",
+   "content": "行指向テキストのため LF を含む値を表現できず、行頭 # や行末空白の扱いも実装依存。",
+   "impact": "値が途中で切れる、行頭 # の行が消える、行末空白が落ちる。いずれも無言で起きる。",
+   "remedy": "--env-file を使わず、-e / ECS secrets / シークレットファイルの直渡しにする。"
+  },
+  {
+   "id": "B-26",
+   "severity": "重大",
+   "place": "S2 base.cli / S7 実行時 standalone.sh",
+   "code": "add-alias(secret-value=\"実値\") / --resolve-parameter-values / standalone.xml への実値書き出し",
+   "content": "実値が式として評価される位置に入ると、${ は Incomplete expression、${} は key can't be empty となる（実測 E-28）。現行の ${env....} 方式ではこれは起きない（実測 E-27）。",
+   "impact": "サーバが起動しない。パスワードに ${ や ${} を含めている環境では、CLI の書き方を変えただけで突然起動しなくなる。",
+   "remedy": "実値を .cli / XML に直書きしない。--resolve-parameter-values を使わない。直書きせざるを得ない場合は $ を $$ へエスケープする。"
+  },
+  {
+   "id": "B-27",
+   "severity": "中",
+   "place": "A3 取得値のコンテナへの受け渡し",
+   "code": "echo -e \"$PW\" / printf '%b' \"$PW\" / /bin/sh が dash・ash のときの echo \"$PW\"",
+   "content": "いずれもバックスラッシュエスケープを解釈するため、\\n の 2 文字が実 LF 1 文字に変わる（実測 E-25）。",
+   "impact": "JCEKS を通るはずだった値が通らなくなる。UBI 9 の /bin/sh は bash なのでコンテナ内では起きないが、登録・配布側が Alpine や CI ランナーだと起きる。",
+   "remedy": "パスワードの受け渡しは printf '%s' に統一する。"
+  },
+  {
+   "id": "B-28",
+   "severity": "重大",
+   "place": "9.3 確認コマンド（本書 前版）",
+   "code": "printf '%s' \"$JBOSS_MASTER_PASSWORD\" | LC_ALL=C grep -q '[^ -~]'",
+   "content": "grep は行指向であり、LF は行区切りとして消費されるため『内容』として検査されない。実測 E-30 で内部改行・末尾改行の両方を見逃すことを確認した。",
+   "impact": "『JCEKS に格納可能』と表示されたのに起動時に Password is not ASCII で落ちる。本書が推奨していた確認手段そのものが、最も多い事故パターンを検出できなかった。",
+   "remedy": "od -An -v -tx1 で 16 進化してからバイト単位で 0x20-0x7E を判定する（第 6 章 0. の bytes_out_of_range）。9.3 の確認コマンドを差し替えた。"
+  },
+  {
+   "id": "B-29",
+   "severity": "中",
+   "place": "A1 パラメータストアへの登録（IaC 経由）",
+   "code": "CloudFormation Fn::Sub / Terraform のテンプレート文字列",
+   "content": "Fn::Sub は ${...} を置換開始として扱い（リテラル化は ${!...}）、Terraform のテンプレート文字列も ${...} を補間する（リテラル化は $${...}）。",
+   "impact": "${ や ${} を含むパスワードを IaC 経由で登録すると、テンプレート展開に失敗するか別の値が登録される。",
+   "remedy": "実値を IaC テンプレートに書かない。パラメータストアへの登録は CLI で行い、IaC からは参照のみ行う。"
+  },
+  {
+   "id": "B-30",
+   "severity": "低",
+   "place": "A1 パラメータストアへの登録（対話シェル）",
+   "code": "aws ssm put-parameter --value \"pa!ss\"",
+   "content": "履歴展開は対話シェル限定だが、登録作業はまさに対話シェルで手打ちされる。ダブルクォート内では抑止されない。",
+   "impact": "! を含むパスワードが別の値として登録される。AWS 側に検証が無いため気付けない。",
+   "remedy": "値は必ずシングルクォートで囲む。あるいは --value file:// でファイルから渡す。"
+  }
+ ],
+ "fixes": [
+  {
+   "file": "0-a. ascii_range_check.sh（新規・共通）",
+   "code": "# 0x20-0x7E の範囲外バイトを検出する。戻り値 0 = 範囲外あり。\n# grep は行指向なので LF を「内容」として見ることができない。\n# 実測 E-30 のとおり printf '%s' \"$PW\" | grep '[^ -~]' は LF を検出できない。\n# したがって od で 16 進化してから判定する。\nbytes_out_of_range() {\n    local hex=\"$1\" i b\n    for (( i=0; i<${#hex}; i+=2 )); do\n        b=$(( 16#${hex:i:2} ))\n        (( b < 0x20 || b > 0x7e )) && return 0\n    done\n    return 1\n}\nhex_of_file() { od -An -v -tx1 < \"$1\" | tr -d ' \\n'; }\nhex_of_var()  { printf '%s' \"$1\" | od -An -v -tx1 | tr -d ' \\n'; }"
+  },
+  {
+   "file": "0-b. put_master_password.sh（新規・登録側）",
+   "code": "#!/usr/bin/env bash\n# マスターパスワードをパラメータストアへ登録する。\n# 「登録できてしまう」ことが事故の原因なので、AWS へ送る前にここで落とす。\nset -euo pipefail\n\n. \"$(dirname \"$0\")/ascii_range_check.sh\"\n\nPARAM_NAME=\"${1:?usage: put_master_password.sh <parameter-name> <plaintext-file>}\"\nPW_FILE=\"${2:?第 2 引数に平文ファイルを指定する（末尾 LF を含めないこと）}\"\n\n# 1) ファイルを「バイト列として」読む。$( ) は末尾 LF を落とすので使わない。\n#    mapfile も read も行指向なので使わない。od 経由で厳密に扱う。\npw_bytes=$(od -An -v -tx1 < \"$PW_FILE\" | tr -d ' \\n')\n[ -n \"$pw_bytes\" ] || { echo \"ERROR: ${PW_FILE} が空である\" >&2; exit 1; }\n\n# 2) 0x20-0x7E 以外を含んでいたら登録させない（JCEKS が受理しない = EV-01）。\nif bytes_out_of_range \"$pw_bytes\"; then\n    echo \"ERROR: 印字可能 ASCII (0x20-0x7E) 以外のバイトを含む。\" >&2\n    echo \"       Enter による改行 (0x0A)・復帰 (0x0D)・タブ (0x09)・非 ASCII は\" >&2\n    echo \"       JCEKS の秘密鍵エントリに格納できないため、ここで登録を拒否する。\" >&2\n    echo \"       実バイト列: ${pw_bytes}\" >&2\n    exit 1\nfi\n\n# 3) 先頭・末尾の空白は目視できず事故の元なので拒否する。\ncase \"$pw_bytes\" in\n    20*|*20) echo \"ERROR: 先頭または末尾に半角スペースがある。\" >&2; exit 1 ;;\nesac\n\n# 4) 登録する。--value file:// はファイルの中身を verbatim に送る（実測 E-19）。\n#    --cli-input-json は JSON デコードを行うため使わない（\\n が実 LF に化ける）。\naws ssm put-parameter \\\n    --name \"$PARAM_NAME\" \\\n    --type SecureString \\\n    --value \"file://${PW_FILE}\" \\\n    --overwrite >/dev/null\n\n# 5) 登録後に必ず読み戻して 16 進で照合する。\n#    これをやらないと「打った表記」と「保存された値」の食い違いに気付けない。\ngot_bytes=$(aws ssm get-parameter --name \"$PARAM_NAME\" --with-decryption \\\n    --output json | jq -j -r '.Parameter.Value' | od -An -v -tx1 | tr -d ' \\n')\nif [ \"$pw_bytes\" != \"$got_bytes\" ]; then\n    echo \"ERROR: 登録値と取得値が一致しない。\" >&2\n    echo \"       put: ${pw_bytes}\" >&2\n    echo \"       get: ${got_bytes}\" >&2\n    exit 1\nfi\necho \"OK: ${PARAM_NAME} を登録した（${#pw_bytes} / 2 = $(( ${#pw_bytes} / 2 )) バイト）\""
+  },
+  {
+   "file": "0-c. fetch_master_password.sh（新規・取得側）",
+   "code": "#!/usr/bin/env bash\n# パラメータストアの値を「1 バイトも変えずに」ファイルへ落とす。\nset -euo pipefail\n\n. \"$(dirname \"$0\")/ascii_range_check.sh\"\n\nPARAM_NAME=\"${1:?usage: fetch_master_password.sh <parameter-name> <out-file>}\"\nOUT=\"${2:?第 2 引数に出力先ファイルを指定する}\"\n\numask 077\n# --output text は値の後ろに LF を 1 個足す（実測 E-21）。\n# PW=$(aws ...) はその LF と値本来の末尾 LF をまとめて削る（実測 E-23）。\n# したがって text も $( ) も使わず、JSON から jq -j -r で直接書き出す。\n#   -r : 文字列をクォート無しで出す   -j : 末尾に改行を付けない\naws ssm get-parameter --name \"$PARAM_NAME\" --with-decryption --output json \\\n    | jq -j -r '.Parameter.Value' > \"$OUT\"\n\n[ -s \"$OUT\" ] || { echo \"ERROR: 取得結果が空である\" >&2; exit 1; }\n\n# 起動側でも範囲チェックする（登録が別経路で行われた場合の保険）。\nout_bytes=$(hex_of_file \"$OUT\")\nif bytes_out_of_range \"$out_bytes\"; then\n    echo \"ERROR: 取得した値が印字可能 ASCII (0x20-0x7E) 以外を含む。\" >&2\n    echo \"       実バイト列: ${out_bytes}\" >&2\n    exit 1\nfi\necho \"OK: ${OUT} ($(wc -c < \"$OUT\") バイト, 末尾 LF なし)\""
+  },
+  {
+   "file": "1. Dockerfile（ベースイメージ）",
+   "code": "# syntax=docker/dockerfile:1.10\n# ^ env= オプションは Dockerfile frontend v1.10.0 以降でのみ有効。必ず宣言すること。\n#   podman/buildah でビルドする場合は env= が宛先として機能しない可能性があるため、\n#   /run/secrets/jboss_master_password から読む形に書き換えること。\n\n# --mount の内側にカンマ後の空白を入れない。\nRUN --mount=type=secret,id=jboss_master_password,env=JBOSS_MASTER_PASSWORD,required=true \\\n    set -eu; \\\n    : \"${JBOSS_MASTER_PASSWORD:?JBOSS_MASTER_PASSWORD is required}\"; \\\n    if printf '%s' \"$JBOSS_MASTER_PASSWORD\" | LC_ALL=C grep -q '[^ -~]'; then \\\n        echo \"FATAL: JBOSS_MASTER_PASSWORD must be printable ASCII (0x20-0x7E).\" >&2; \\\n        echo \"       JCEKS cannot store TAB/CR/LF/non-ASCII (SunJCE: Password is not ASCII).\" >&2; \\\n        exit 1; \\\n    fi; \\\n    umask 077; \\\n    \"${JBOSS_HOME}/bin/jboss-cli.sh\" --echo-command --file=\"${JBOSS_HOME}/setup/base.cli\"\n\n# シークレットファイルは末尾 LF なしで生成すること:\n#   printf '%s' \"$PW\" > ./secrets/jboss_master_password\n#   docker build --secret id=jboss_master_password,src=./secrets/jboss_master_password ."
+  },
+  {
+   "file": "2. base.cli",
+   "code": "embed-server --server-config=standalone.xml --std-out=echo\n\n/path=secrets.dir:add(path=security, relative-to=jboss.server.config.dir)\n\n/subsystem=elytron/credential-store=EAPCS:add( \\\n    location=\"secrets.jceks\", \\\n    relative-to=secrets.dir, \\\n    credential-reference={clear-text=\"${env.JBOSS_MASTER_PASSWORD}\"}, \\\n    create=true)\n\nstop-embedded-server\n\n# 実値は CLI 本文に現れないため、CLI 字句解析・XML 構文・ログのいずれにも\n# パスワードが露出しない。この方式を崩さないこと。\n# --resolve-parameter-values は使用しないこと（式が実値に解決されて\n# standalone.xml へ書き出され、XML 属性値正規化で TAB/LF/CR が空白化する）。"
+  },
+  {
+   "file": "3. base-env.sh",
+   "code": "#!/usr/bin/env bash\n# 非クォートの export は bash/dash では偶然動くが仕様依存。必ずクォートする。\n\n: \"${JBOSS_ADMIN_USER:=admin}\"\nexport JBOSS_ADMIN_USER\n\nexport JBOSS_ADMIN_PASSWORD=\"${JBOSS_ADMIN_PASSWORD:?JBOSS_ADMIN_PASSWORD is required}\"\nexport JBOSS_MASTER_PASSWORD=\"${JBOSS_MASTER_PASSWORD:?JBOSS_MASTER_PASSWORD is required}\"\n\n# JCEKS(SunJCE PBE) の受理範囲は印字可能 ASCII 0x20-0x7E のみ。\n# タブ・改行・復帰・非 ASCII はここで落とす（後段では原因が分からないエラーになる）。\nfor _v in JBOSS_ADMIN_PASSWORD JBOSS_MASTER_PASSWORD; do\n    if printf '%s' \"${!_v}\" | LC_ALL=C grep -q '[^ -~]'; then\n        echo \"FATAL: ${_v} must consist of printable ASCII only (0x20-0x7E).\" >&2\n        exit 1\n    fi\ndone\nunset _v"
+  },
+  {
+   "file": "4. create-admin-user.sh",
+   "code": "#!/usr/bin/env bash\nset -euo pipefail\n\necho \"startup shell executing .. startup/create-admin-user.sh\"\n\n# -sc の引数もクォートする。\n\"${JBOSS_HOME}/bin/add-user.sh\" \\\n    -sc \"${JBOSS_HOME}/standalone/configuration\" \\\n    \"${JBOSS_ADMIN_USER}\" \\\n    \"${JBOSS_ADMIN_PASSWORD}\"\n\n# 注意: add-user.sh は引数にパスワードを取るため ps から見える。\n# 恒久対策としては mgmt-users.properties をビルド時に生成するか、\n# Elytron の filesystem-realm へ移行して jboss-cli 経由で登録する。"
+  },
+  {
+   "file": "5. store_credentials.sh（全面書き換え）",
+   "code": "#!/usr/bin/env bash\nset -euo pipefail\n\necho \"startup shell executing ... startup/store_credentials.sh\"\n\nSECRETS_DIR=\"${JBOSS_HOME}/standalone/configuration/security\"\nCREDENTIAL_STORE=\"${SECRETS_DIR}/secrets.jceks\"\n\n: \"${JBOSS_MASTER_PASSWORD:?JBOSS_MASTER_PASSWORD is required}\"\n\n# JCEKS(SunJCE PBE) が受理するのは印字可能 ASCII 0x20-0x7E のみ。\n# 範囲外だと空ストア作成は通り、最初の add-alias で Password is not ASCII になる。\n# ここで先に落として原因を明示する。\nassert_printable_ascii() {\n    local name=\"$1\" val=\"$2\"\n    if printf '%s' \"${val}\" | LC_ALL=C grep -q '[^ -~]'; then\n        echo \"FATAL: ${name} contains a character outside printable ASCII (0x20-0x7E).\" >&2\n        echo \"       JCEKS credential store cannot store it (SunJCE: Password is not ASCII).\" >&2\n        exit 1\n    fi\n}\nassert_printable_ascii JBOSS_MASTER_PASSWORD \"${JBOSS_MASTER_PASSWORD}\"\n\numask 077\nmkdir -p \"${SECRETS_DIR}\"\nrm -f \"${CREDENTIAL_STORE}\"\n\njboss_credential_store() {\n    # $* ではなく \"$@\" を使う。これで空白・タブ・改行・グロブ文字を含む\n    # 引数が分割・展開されなくなる。\n    \"${JBOSS_HOME}/bin/elytron-tool.sh\" credential-store \\\n        --location \"${CREDENTIAL_STORE}\" \\\n        --password \"${JBOSS_MASTER_PASSWORD}\" \\\n        \"$@\"\n}\n\njboss_credential_store --create\n\n# printenv の行パースを廃止する。\n# compgen -e は「環境変数名」だけを列挙する。変数名に = や改行は含まれ得ないため\n# 行指向で安全に読める。値は間接展開 ${!name} で直接取得し、テキスト行を経由しない。\n# これにより改行注入・バックスラッシュ消費・末尾空白トリムがすべて構造的に消滅する。\nwhile IFS= read -r name; do\n    [ \"${name}\" = \"JBOSS_MASTER_PASSWORD\" ] && continue\n    case \"${name}\" in\n        JBOSS_*_PASSWORD) ;;\n        *) continue ;;\n    esac\n\n    secret=\"${!name}\"\n    assert_printable_ascii \"${name}\" \"${secret}\"\n\n    key=\"${name#JBOSS_}\"\n    cs_alias=\"$(printf '%s' \"${key}\" | tr '[:upper:]_' '[:lower:]-')\"\n\n    echo \"Adding alias: ${cs_alias}\"\n    jboss_credential_store --add \"${cs_alias}\" --secret \"${secret}\"\ndone < <(compgen -e | LC_ALL=C sort)\n# プロセス置換にすることでループが親シェルで動き、set -e による失敗検知が効く。"
+  },
+  {
+   "file": "5b. argv へのパスワード露出を無くす代替案（推奨）",
+   "code": "# elytron-tool.sh は --password / --secret を argv で受け取るため ps から見える。\n# jboss-cli 経由なら式を使えるので、パスワードは一切 argv に載らない。\n\n# store_credentials.cli （jboss-cli --file= で実行）\n/subsystem=elytron/credential-store=EAPCS:add-alias( \\\n    alias=admin-password, \\\n    secret-value=\"${env.JBOSS_ADMIN_PASSWORD}\")\n\n# 起動中サーバに対して実行する場合:\n#   \"${JBOSS_HOME}/bin/jboss-cli.sh\" --connect --file=store_credentials.cli\n# ビルド時に実行する場合は embed-server / stop-embedded-server で囲む。\n#\n# エイリアスを動的に決めたい場合は、上記 .cli をシェルで生成する。\n# その際もパスワード実値は書き込まず ${env.VAR} 参照のみを書くこと。"
+  },
+  {
+   "file": "6. run_config_scripts.sh",
+   "code": "#!/usr/bin/env bash\nset -euo pipefail\n\nrun_config_script() {\n    local FILE=\"$1\"\n    echo \"Running ${FILE}\"\n    case \"${FILE}\" in\n        *.sh)\n            # shellcheck disable=SC1090\n            source \"${FILE}\"\n            ;;\n        *.cli)\n            echo \"processing ${JBOSS_HOME}/bin/jboss-cli.sh\"\n            \"${JBOSS_HOME}/bin/jboss-cli.sh\" --file=\"${FILE}\"\n            ;;\n    esac\n}\n\n# $* ではなく \"$@\"。空白を含むパスでも壊れない。\nfor ARG in \"$@\"; do\n    if [[ -d \"${ARG}\" ]]; then\n        # find -print0 / read -d '' で改行を含むファイル名にも耐える。\n        while IFS= read -r -d '' FILE; do\n            echo \"processing target file is ${FILE}\"\n            run_config_script \"${FILE}\"\n        done < <(find \"${ARG}\" -type f -print0 | sort -z)\n    else\n        echo \"processing target arg is ${ARG}\"\n        run_config_script \"${ARG}\"\n    fi\ndone"
+  },
+  {
+   "file": "7. entrypoint.sh",
+   "code": "#!/usr/bin/env bash\nset -euo pipefail\n\n. \"${JBOSS_HOME}/environment/base-env.sh\"\n. \"${JBOSS_HOME}/setup/eap-env.sh\"\n\n# seed を先に展開してから資格情報ストアを 1 回だけ作る（rm -f による作り直しを避ける）。\ncp -a \"${JBOSS_HOME}/standalone/configuration-seed/.\" \\\n      \"${JBOSS_HOME}/standalone/configuration/\"\n\n\"${JBOSS_HOME}/bin/run-config-scripts.sh\" \"${JBOSS_HOME}/startup/create-admin-user.sh\"\n\"${JBOSS_HOME}/bin/run-config-scripts.sh\" \"${JBOSS_HOME}/startup/store_credentials.sh\"\n\ninstall -m 0644 \\\n    \"/online/deploy/iwinmichl.war\" \\\n    \"${JBOSS_HOME}/standalone/deployments/iwinmichl.war\"\n\n# JBOSS_SERVER_OPTS は配列で持つのが安全（文字列の非クォート展開は避ける）。\nexec \"${JBOSS_HOME}/bin/standalone.sh\" \\\n    -b 0.0.0.0 \\\n    -bmanagement 0.0.0.0 \\\n    -c \"standalone.xml\" \\\n    ${JBOSS_SERVER_OPTS:-}"
+  }
+ ],
+ "policy": [
+  {
+   "category": "禁止（技術的に不可能）",
+   "target": "実改行 LF (0x0A) / 復帰 CR (0x0D) / タブ (0x09) / 非 ASCII",
+   "rationale": "OpenJDK の SunJCE が JCEKS 秘密鍵エントリの PBE パスワードを印字可能 ASCII (0x20-0x7E) に限定するため、資格情報ストアに格納できない（OpenJDK 21 で実測 E-17）。Enter キーで改行を入れた値・末尾で Enter を押した値はいずれもこれに該当する。パラメータストアは何の警告も出さずに保存してしまうので（実測 E-20）、登録スクリプト側で拒否するしかない。"
+  },
+  {
+   "category": "許可される文字集合",
+   "target": "0x20-0x7E の 95 文字（半角スペースを含む印字可能 ASCII 全て）",
+   "rationale": "JCEKS が受理する範囲と完全に一致する。この範囲内であれば # $ ^ ! | \\ 半角スペース を含め、シェル側を修正すればすべて安全に扱える。"
+  },
+  {
+   "category": "許可",
+   "target": "# $ ^ ! | ( ) [ ] { } < > ? * + - _ = . , : ; / @ % & ~ ' \" `",
+   "rationale": "現行コードでも修正後コードでも安全に通過する。$ は環境変数を設定する側（compose / K8s）でのエスケープのみ注意。"
+  },
+  {
+   "category": "修正後に許可",
+   "target": "\\ （バックスラッシュ）",
+   "rationale": "現行コードでは read の -r 欠落により破壊される。IFS= read -r への修正、または compgen -e 方式への置換後は安全。"
+  },
+  {
+   "category": "修正後に許可（先頭・末尾を除く）",
+   "target": "半角スペース / タブ（値の途中のみ）",
+   "rationale": "現行コードでは $* の単語分割で破壊される。\"$@\" 化と compgen -e 方式で解決する。ただし先頭・末尾の空白類は受け渡し経路（--env-file、CI 変数欄）でトリムされる実装があるため、修正後も禁止を推奨。"
+  },
+  {
+   "category": "非推奨",
+   "target": "タブ（位置を問わず）",
+   "rationale": "画面上不可視で、値が壊れても検知できない。YAML / .env / CI 入力欄で空白へ変換されたり消えたりする。"
+  },
+  {
+   "category": "禁止",
+   "target": "LF (\\n) / CR (\\r)",
+   "rationale": "printenv 行パースの切り詰め、grep -v の素通り、資格情報ストアへのエイリアス注入（実測で再現）、XML 属性値正規化による空白化、--env-file で表現不可能、ビルド時と実行時のバイト不一致。コード修正でも運用上のリスクが残るため一律禁止。"
+  },
+  {
+   "category": "禁止",
+   "target": "NUL (\\0)",
+   "rationale": "環境変数・argv とも NUL 区切りのため、そもそも値として格納できない。"
+  },
+  {
+   "category": "運用ルール",
+   "target": "シークレットファイルは末尾 LF なしで生成する",
+   "rationale": "printf '%s' \"$PW\" > secret_file。echo を使うと LF が混入し、ビルド時と実行時の値が食い違う。"
+  },
+  {
+   "category": "運用ルール",
+   "target": "ビルド時と実行時に同一バイト列を渡す",
+   "rationale": "BuildKit secret と実行時の環境変数で経路が異なるため、CI で同一ソースから配布し、起動時にハッシュ等で一致を検証する。"
+  },
+  {
+   "category": "運用ルール",
+   "target": "argv にパスワードを載せない",
+   "rationale": "ps -ef / /proc/<pid>/cmdline から読める。jboss-cli の ${env....} 式方式へ寄せる。"
+  },
+  {
+   "category": "条件付き許可（要注意）",
+   "target": "`\\n` の 2 文字リテラル（U+005C U+006E）",
+   "rationale": "JCEKS は受理する（実測 E-17）。ただし『改行のつもりで打った』誤解の温床であり、store_credentials.sh の read（-r 欠落）が panss に潰す（実測 E-26）。修正後コードなら安全に扱えるが、登録直後に 16 進で照合すること。echo -e / printf '%b' / dash の echo を経由すると実 LF に化ける（実測 E-25）。"
+  },
+  {
+   "category": "条件付き許可（設計を崩さないこと）",
+   "target": "`${` / `${}` / `${env.…}` の形をした値",
+   "rationale": "現行の ${env.JBOSS_MASTER_PASSWORD} 方式では解決結果が再走査されないため完全に無害（実測 E-27）。しかし実値を .cli / standalone.xml に直書きした瞬間、${ は Incomplete expression、${} は key can't be empty でサーバが起動しない（実測 E-28）。IaC 経由で登録する場合は CloudFormation Fn::Sub / Terraform 側の補間にも注意（B-29）。安全側に倒すなら ${ を含めない。"
+  },
+  {
+   "category": "運用ルール",
+   "target": "パラメータストアへの登録は 1 経路に統一する",
+   "rationale": "--value（無解釈）と --cli-input-json（JSON デコード）とコンソール（Enter が実 LF）で、同じ見た目の入力が別のバイト列になる（実測 E-19）。--value file:// に統一する。"
+  },
+  {
+   "category": "運用ルール",
+   "target": "登録直後に必ず読み戻して 16 進で照合する",
+   "rationale": "AWS 側に文字種の検証が存在しない以上（実測 E-20）、照合が唯一の検出手段である。put_master_password.sh はこれを組み込んでいる。"
+  },
+  {
+   "category": "運用ルール",
+   "target": "取得は --output json + jq -j -r で行う",
+   "rationale": "--output text は末尾に LF を足し（実測 E-21）、$( ) がそれを値本来の末尾 LF ごと削る（実測 E-23）。jq -j なら末尾改行を付けずに書き出せる。"
+  },
+  {
+   "category": "運用ルール",
+   "target": "ASCII 範囲チェックに grep を使わない",
+   "rationale": "grep は行指向なので LF を内容として検査できず、最も多い事故パターンを見逃す（実測 E-30）。od で 16 進化してからバイト単位で判定する。"
+  }
+ ],
+ "experiments": [
+  {
+   "id": "E-01",
+   "title": "export の非クォート展開で単語分割・グロブは起きるか",
+   "command": "SRC='a b\\tc'; export DST=${SRC}",
+   "result": "DST=[a b\\tc]（分割されず）。glob: SRC='*' でも DST=[*] のまま。改行: $'x\\ny' も od -c で x \\n y を保持。bash --posix / dash でも同結果。",
+   "meaning": "S3 は現状問題なし。ただし宣言コマンド規則への依存であり明示クォートすべき。"
+  },
+  {
+   "id": "E-02",
+   "title": "read（IFS=・-r なし）は行末の空白／タブを削るか",
+   "command": "printf 'JBOSS_ADMIN_PASSWORD=  lead and trail  \\n' | while read line",
+   "result": "read     -> [JBOSS_ADMIN_PASSWORD=  lead and trail]（末尾 2 空白が消失）\\nIFS= read -r -> [JBOSS_ADMIN_PASSWORD=  lead and trail  ]（保持）。タブでも同様に末尾タブが消失。",
+   "meaning": "S5 で値末尾の空白／タブが静かに失われる。"
+  },
+  {
+   "id": "E-03",
+   "title": "read（-r なし）はバックスラッシュを消費するか",
+   "command": "printf 'JBOSS_ADMIN_PASSWORD=pa\\\\ss\\\\\\\\word\\n' | while read line",
+   "result": "read     -> [JBOSS_ADMIN_PASSWORD=password]（バックスラッシュが消滅）\\nIFS= read -r -> [JBOSS_ADMIN_PASSWORD=pa\\\\ss\\\\word]（保持）",
+   "meaning": "S5 でバックスラッシュを含む秘密情報が破壊される。"
+  },
+  {
+   "id": "E-04",
+   "title": "行末バックスラッシュは次行と連結されるか",
+   "command": "'JBOSS_A_PASSWORD=end\\\\' と 'JBOSS_B_PASSWORD=next' の 2 行を read",
+   "result": "read     -> [JBOSS_A_PASSWORD=endJBOSS_B_PASSWORD=next]（1 行に連結）\\nIFS= read -r -> 2 行として正しく分離",
+   "meaning": "末尾がバックスラッシュのパスワードは隣の秘密情報まで巻き込んで破壊する。"
+  },
+  {
+   "id": "E-05",
+   "title": "$* と \"$@\" の差",
+   "command": "show(){ printf 'ARG[%s]\\n' $*; }; show --add a --secret 'my pass word'",
+   "result": "$*  -> ARG[--add] ARG[a] ARG[--secret] ARG[my] ARG[pass] ARG[word]（4 語に分解）\\n\"$@\" -> ARG[--secret] ARG[my pass word]（保持）\\nグロブ: --secret '*' が $* ではカレントディレクトリのファイル名 aaa bbb に展開された。\\n改行: $'x\\ny' が x と y に分解。\\n一方 'p|q#r$s^t!u\\\\v' は $* でも単一引数のまま保持された。",
+   "meaning": "空白・タブ・改行・グロブ文字のみが $* で壊れる。| # $ ^ ! \\\\ は壊れない。"
+  },
+  {
+   "id": "E-06",
+   "title": "[[ =~ ]] の被検査文字列側でメタ文字は悪さをするか",
+   "command": "line=\"JBOSS_ADMIN_PASSWORD=$v\"; [[ ${line} =~ JBOSS_(.*_PASSWORD)=(.*) ]]",
+   "result": "p#q / p$q / p^q / p!q / p q / p|q / p\\\\q / p*q はすべて BASH_REMATCH[2] に完全一致で格納された。\\n一方 値 'a_PASSWORD=b' では key=[ADMIN_PASSWORD=a_PASSWORD] captured=[b] となり貪欲マッチでずれた。",
+   "meaning": "記号自体は正規表現側で無害。ただし値に _PASSWORD= を含むとキャプチャが壊れる。"
+  },
+  {
+   "id": "E-07",
+   "title": "未アンカー正規表現は無関係な変数に一致するか",
+   "command": "line='MY_JBOSS_ADMIN_PASSWORD=x'",
+   "result": "一致し key=ADMIN_PASSWORD が得られた。",
+   "meaning": "意図しない変数が資格情報ストアへ登録される。"
+  },
+  {
+   "id": "E-08",
+   "title": "改行入りマスターパスワードによるエイリアス注入",
+   "command": "export JBOSS_MASTER_PASSWORD=$'Mast\\nPART2\\nJBOSS_FAKE_PASSWORD=injected' の状態で\\nprintenv | grep -v JBOSS_MASTER_PASSWORD | while read line ... を実行",
+   "result": "grep -v を素通りした行として PART2 と JBOSS_FAKE_PASSWORD=injected が残り、ループは\\n  alias=fake-password secret=[injected]\\n  alias=admin-password secret=[adminpw]\\nの 2 件を登録対象として検出した。",
+   "meaning": "マスターパスワードの内容で資格情報ストアに任意エイリアスを注入できる。最重要の欠陥。"
+  },
+  {
+   "id": "E-09",
+   "title": "# は展開結果でコメントになるか / ! は非対話で履歴展開されるか",
+   "command": "V='#leading'; set -- --secret $V / bash -c 'V=\"a!b\"; ...'",
+   "result": "ARG[--secret] ARG[#leading]（コメント化しない）。非対話シェルでは set -H を付けても a!b のまま。",
+   "meaning": "# と ! は本コードで問題なし。"
+  },
+  {
+   "id": "E-10",
+   "title": "提示された store_credentials.sh は構文的に妥当か",
+   "command": "提示コード（echo の閉じダブルクォートあり）を bash -n に掛ける",
+   "result": "exit=0。構文エラーなし。スクリプトは正常に実行される。",
+   "meaning": "当初 echo の閉じクォート欠落を指摘したが誤りであった。構文上の問題は存在しない。以降の指摘はすべて実行時の挙動に関するもの。"
+  },
+  {
+   "id": "E-11",
+   "title": "実スクリプトでの記号通過テスト（elytron-tool.sh をスタブ化して argv を観測）",
+   "command": "JBOSS_ADMIN_PASSWORD に各記号を設定し store_credentials.sh をそのまま実行。\nelytron-tool.sh が受け取った argv を出力。",
+   "result": "input=[p#q] -> --secret [p#q]        …保持\ninput=[p$q] -> --secret [p$q]        …保持\ninput=[p^q] -> --secret [p^q]        …保持\ninput=[p!q] -> --secret [p!q]        …保持\ninput=[p|q] -> --secret [p|q]        …保持\ninput=[p\\q] -> --secret [pq]         …バックスラッシュ消失\ninput=[p q] -> --secret [p] [q]      …2 引数に分裂\ninput=[p<TAB>q] -> --secret [p] [q]  …2 引数に分裂",
+   "meaning": "# $ ^ ! | は実スクリプトでも無傷で通過する。\\ は read の -r 欠落で消え、空白とタブは $* の単語分割で分裂する。判定表と完全に一致した。"
+  },
+  {
+   "id": "E-12",
+   "title": "実スクリプトでの複合破壊（空白 + バックスラッシュ + 末尾タブ）",
+   "command": "JBOSS_ADMIN_PASSWORD='ad min\\pw<TAB>' を設定し store_credentials.sh を実行",
+   "result": "elytron-tool ARGV: ... [--add] [admin-password] [--secret] [ad] [minpw]",
+   "meaning": "空白による分裂・バックスラッシュの消費・末尾タブのトリムが 1 回の実行で同時に起きた。本来 1 つであるべき秘密値が [ad] と [minpw] の 2 引数になり、値も元と異なる。"
+  },
+  {
+   "id": "E-13",
+   "title": "実スクリプトでの改行注入（エンドツーエンド）",
+   "command": "JBOSS_MASTER_PASSWORD=$'Mast\\nJBOSS_FAKE_PASSWORD=injected' を設定し store_credentials.sh を実行",
+   "result": "elytron-tool ARGV: ... [--add] [fake-password] [--secret] [injected]\nelytron-tool ARGV: ... [--add] [admin-password] [--secret] [adminpw]",
+   "meaning": "マスターパスワードに仕込んだ 2 行目が grep -v を素通りして正規表現に一致し、実在しない環境変数 JBOSS_FAKE_PASSWORD 由来のエイリアス fake-password が実際に登録された。スタブではなく提示コードそのものでの再現であり、資格情報ストアへの注入が成立する。"
+  },
+  {
+   "id": "E-14",
+   "title": "JCEKS は各記号を含むパスワードを受理するか（OpenJDK 17.0.11 で実測）",
+   "command": "JCEKS キーストアを作成し SecretKeyEntry を同一パスワードで保護して格納 →\\n保存 → 再読込 → 取り出し、のラウンドトリップを実施",
+   "result": "#  p#q      OK    round-trip ok\\n$  p$q      OK    round-trip ok\\n^  p^q      OK    round-trip ok\\n!  p!q      OK    round-trip ok\\n|  p|q      OK    round-trip ok\\n\\\\  p\\\\q      OK    round-trip ok\\nSP p q      OK    round-trip ok\\n末尾SP pq   OK    round-trip ok\\nTAB p<TAB>q FAIL  KeyStoreException: Password is not ASCII\\nLF  p<LF>q  FAIL  KeyStoreException: Password is not ASCII\\n非ASCII péq FAIL  KeyStoreException: Password is not ASCII\\n非ASCII pパq FAIL KeyStoreException: Password is not ASCII",
+   "meaning": "# $ ^ ! | \\\\ 半角スペース（末尾含む）は資格情報ストアでも問題ない。タブ・改行・非 ASCII は格納自体が不可能。"
+  },
+  {
+   "id": "E-15",
+   "title": "どの操作で失敗するのか、受理される文字コード範囲はどこまでか",
+   "command": "load(null) / setEntry(SecretKeyEntry) / store() / reload() / getEntry() のどこで例外が出るかを切り分け、\\n続けて 0x00-0xFF の全 256 文字について格納可否を走査",
+   "result": "TAB(0x09)     -> setEntry(SecretKey): InvalidKeySpecException / Password is not ASCII\\nLF(0x0A)      -> setEntry(SecretKey): InvalidKeySpecException / Password is not ASCII\\nCR(0x0D)      -> setEntry(SecretKey): InvalidKeySpecException / Password is not ASCII\\nSPACE(0x20)   -> OK\\ne-acute(0xE9) -> setEntry(SecretKey): InvalidKeySpecException / Password is not ASCII\\n受理される連続範囲: 0x20 - 0x7E　受理された文字数: 95 / 256",
+   "meaning": "失敗するのは秘密鍵エントリの格納時のみ。受理範囲は印字可能 ASCII に正確に一致する。"
+  },
+  {
+   "id": "E-16",
+   "title": "秘密鍵エントリを含まない空ストアなら通ってしまうか",
+   "command": "SecretKeyEntry を入れずに JCEKS の store() と load() のみを実行",
+   "result": "TAB(0x09)     -> OK\\nLF(0x0A)      -> OK\\nCR(0x0D)      -> OK\\nSPACE(0x20)   -> OK\\ne-acute(0xE9) -> OK",
+   "meaning": "ストア整合性 MAC は任意の文字を受理する。したがって base.cli の create=true による空ストア作成はビルド時に成功し、失敗は最初のエイリアス登録まで遅延する。ビルドは通るのに起動で落ちる最悪の失敗形態。"
+  },
+  {
+   "id": "E-17",
+   "title": "JCEKS は新パターンを含むパスワードを受理するか（OpenJDK 21.0.10 で実測）",
+   "command": "KeyStore(JCEKS) に SecretKeyEntry を setEntry → store → load → getEntry の往復。実行環境と同じ OpenJDK 21 を使用。",
+   "result": "pa\\nss (70 61 5C 6E 73 73)  OK  round-trip ok\npa${ss (70 61 24 7B 73 73)  OK  round-trip ok\npa${}ss (70 61 24 7B 7D 73 73)  OK  round-trip ok\n${env.JBOSS_MASTER_PASSWORD} （28 バイト）  OK  round-trip ok\npa$${ss  OK  round-trip ok\npa<LF>ss (70 61 0A 73 73)  FAIL  InvalidKeySpecException: Password is not ASCII\npass<LF> (70 61 73 73 0A)  FAIL  同上\npass<CRLF>  FAIL  同上\npa<CR>ss  FAIL  同上",
+   "meaning": "\\n の 2 文字リテラル・${・${} はいずれも 0x20-0x7E の範囲内なので JCEKS 層では問題ない。実 LF は内部・末尾を問わず拒否される。前版で OpenJDK 17 について述べた結論が、実行環境の OpenJDK 21 でもそのまま成立することを確認した。"
+  },
+  {
+   "id": "E-18",
+   "title": "空ストア作成だけなら実 LF でも通ってしまうか（OpenJDK 21 で再確認）",
+   "command": "SecretKeyEntry を入れずに KeyStore(JCEKS).store() のみを実行する（base.cli の create=true 相当）。",
+   "result": "pa<LF>ss  OK  empty store created (32 bytes)\npass<LF>  OK  empty store created (32 bytes)\npa\\nss    OK  empty store created (32 bytes)\npa${}ss   OK  empty store created (32 bytes)",
+   "meaning": "EV-02 のとおり、空ストア作成は改行入りパスワードでも成功する。ビルドは通り、最初のエイリアス登録で初めて落ちる。OpenJDK 21 でも同じ。"
+  },
+  {
+   "id": "E-19",
+   "title": "aws ssm put-parameter は入力経路ごとに何バイトを送るか",
+   "command": "botocore の before-send フックで実際のリクエストボディを捕捉し、Value フィールドを 16 進で出力した（AWS CLI 1.46.1 / botocore 1.43）。",
+   "result": "--value 'pa\\nss'                  -> 70 61 5C 6E 73 73 （2 文字のまま）\n--value $'pa\\nss'（実 LF）        -> 70 61 0A 73 73\n--value 'pa${}ss'                -> 70 61 24 7B 7D 73 73\n--value 'pa${ss'                 -> 70 61 24 7B 73 73\n--value file://（末尾 LF 無）     -> 70 61 73 73\n--value file://（末尾 LF 有）     -> 70 61 73 73 0A （verbatim）\n--cli-input-json \"pa\\\\nss\"        -> 70 61 5C 6E 73 73\n--cli-input-json \"pa\\nss\"         -> 70 61 0A 73 73 （JSON デコードで実 LF）\nsecretsmanager --secret-string '{\"password\":\"pa\\nss\"}' -> 生の JSON テキスト（5C 6E を含む 21 バイト）",
+   "meaning": "AWS CLI は --value にエスケープ解釈を行わず、--cli-input-json は JSON デコードを行う。同じ『\\n』という見た目が経路で別のバイト列になる。file:// は末尾 LF ごと verbatim に送る。"
+  },
+  {
+   "id": "E-20",
+   "title": "AWS 側に文字種の制約はあるか",
+   "command": "botocore のサービスモデルから PutParameter.Value と CreateSecret.SecretString の制約メタデータを読み出した。",
+   "result": "ssm PutParameter    Value        {\"sensitive\": true}                       ← min/max も pattern も無し\nsecretsmanager CreateSecret  SecretString {\"min\":1,\"max\":65536,\"sensitive\":true}  ← pattern 無し",
+   "meaning": "パターン制約が存在しない。改行・タブ・非 ASCII・${} はすべて正当な値として受理される。AWS 側での事前検出は構造的に期待できない（B-22）。"
+  },
+  {
+   "id": "E-21",
+   "title": "--output text / --output json は値をどう出力するか",
+   "command": "awscli のフォーマッタへ Parameter.Value を与え、出力バイト列を観測した。",
+   "result": "値 pa<LF>ss  -> text: 70 61 0A 73 73 0A （末尾に LF が 1 個足される）  json: \"pa\\nss\"\n値 pass<LF>  -> text: 70 61 73 73 0A 0A （LF が 2 個並ぶ）          json: \"pass\\n\"\n値 pa\\nss    -> text: 70 61 5C 6E 73 73 0A                          json: \"pa\\\\nss\"\n値 pa${}ss   -> text: 70 61 24 7B 7D 73 73 0A                       json: \"pa${}ss\"\n値 pa<TAB>ss -> text: 70 61 09 73 73 0A                             json: \"pa\\tss\"",
+   "meaning": "text は必ず末尾に LF を 1 個足す。この LF と値本来の末尾 LF が区別できないことが B-20 の原因。json は情報を失わないので、取得は json + jq に寄せるべき。"
+  },
+  {
+   "id": "E-22",
+   "title": "get-parameters（複数形）の text 出力を行パースすると何が起きるか",
+   "command": "Parameters[].[Name,Value] を text 整形し（値に内部 LF あり）、IFS=$'\\t' read -r で行パースした。",
+   "result": "text 出力: '/a\\tpa\\nss\\n/b\\tother\\n'\n行パース結果:\n  name=[/a] value=[pa]      ← 値が途中で切れた\n  name=[ss] value=[]        ← 存在しないレコードが生成された\n  name=[/b] value=[other]",
+   "meaning": "値中の LF がレコード境界と区別できない。誤ったエイリアスが資格情報ストアへ登録されうる（B-23）。E-08 のエイリアス注入と同じ構造が、パラメータストアの取得段でも成立する。"
+  },
+  {
+   "id": "E-23",
+   "title": "$( ) は末尾 LF をどこまで削るか",
+   "command": "aws の text 出力を模した printf '%s\\n' \"$値\" を $( ) で受け、原値と 16 進で突き合わせた。",
+   "result": "値 pa<LF>ss  -> 70 61 0A 73 73        一致（内部 LF は保持される）\n値 pass<LF>  -> 70 61 73 73            ★不一致（末尾 LF が消失）\n値 pass<LF><LF> -> 70 61 73 73         ★不一致（末尾 LF が全て消失）\n値 pass      -> 70 61 73 73            一致",
+   "meaning": "$( ) が削るのは末尾 LF のみで、しかも何個あっても全部削る。末尾に Enter を含む値は取得した時点で別物になる（B-20）。半角スペースは削られない。"
+  },
+  {
+   "id": "E-24",
+   "title": "シークレットファイルの作り方で末尾バイトはどう変わるか",
+   "command": "値 pass に対し 3 通りの書き出しを行い、末尾に番兵 X を付けて od で観測した。",
+   "result": "aws ... > file                 -> 70 61 73 73 0A 58  ← CLI が足した LF が残る\nprintf '%s' \"$(aws ...)\" > file -> 70 61 73 73 58     ← 末尾 LF 無し\necho -n \"$(aws ...)\" > file     -> 70 61 73 73 58     ← 末尾 LF 無し",
+   "meaning": "リダイレクトは末尾 LF を削らない。$( ) 経由は削りすぎる。原値に末尾 LF を持たせない運用にしたうえで jq -j -r で書き出すのが唯一の一致経路（B-24）。"
+  },
+  {
+   "id": "E-25",
+   "title": "\\n の 2 文字を実 LF に変えてしまう経路はどれか",
+   "command": "値 pa\\nss（70 61 5C 6E 73 73）を各種の出力手段に通し、結果を 16 進で観測した。",
+   "result": "そのまま            70 61 5C 6E 73 73\necho -e \"$v\"        70 61 0A 73 73   ★実 LF に変換\nprintf '%b' \"$v\"    70 61 0A 73 73   ★実 LF に変換\nsh -c 'echo ...'    70 61 0A 73 73   ★実 LF に変換（/bin/sh が dash の場合）\nprintf '%s' \"$v\"    70 61 5C 6E 73 73\necho \"$v\" (bash)    70 61 5C 6E 73 73\njq -r（JSON の \\\\n） 70 61 0A 73 73   ★実 LF に変換",
+   "meaning": "受け渡しに printf '%s' 以外を使うと、JCEKS を通るはずだった値が通らなくなる（B-27）。UBI 9 の /bin/sh は bash なのでコンテナ内では起きないが、登録側・CI 側で起きる。"
+  },
+  {
+   "id": "E-26",
+   "title": "${ / ${} / \\n は read・正規表現・$* を通過するか",
+   "command": "行 JBOSS_ADMIN_PASSWORD=<値> を read（-r なし）/ IFS= read -r / [[ =~ JBOSS_(.*_PASSWORD)=(.*) ]] / $* に通した。",
+   "result": "値 pa${}ss                     read=[pa${}ss] IFS=read -r=[pa${}ss] capture=[pa${}ss] $*=単一引数\n値 pa${ss                      read=[pa${ss]  IFS=read -r=[pa${ss]  capture=[pa${ss]  $*=単一引数\n値 ${env.JBOSS_MASTER_PASSWORD} read=[同左]    IFS=read -r=[同左]    capture=[同左]\n値 pa\\nss                      read=[panss] ★ IFS=read -r=[pa\\nss] capture=[pa\\nss] $*=単一引数",
+   "meaning": "${ と ${} はシェル段をすべて無変化で通過する。一方 \\n の 2 文字は read の -r 欠落だけで panss に化ける。資格情報ストアには panss が入り、実行時の環境変数は pa\\nss のままなので、ストアは作れるのに開けないという壊れ方をする。"
+  },
+  {
+   "id": "E-27",
+   "title": "WildFly の式解決は解決結果を再走査するか（jboss-dmr 1.6.1.Final で実測）",
+   "command": "ValueExpression(\"${env.JBOSS_MASTER_PASSWORD}\").resolveString(resolver) を、env 値を各パターンに差し替えて実行した。",
+   "result": "値 pa${}ss           -> [pa${}ss]\n値 pa${ss            -> [pa${ss]\n値 pa\\nss            -> [pa\\nss]\n値 ${env.OTHER}      -> [${env.OTHER}]  （別の式として再解決はされない）\n値 pa$${ss           -> [pa$${ss]\n値 pa${env.OTHER}ss  -> [pa${env.OTHER}ss]",
+   "meaning": "解決結果は一切再走査されない。現行の base.cli 方式を保つ限り、${ / ${} / \\n / 完全な式形のいずれをパスワードにしても S2 は安全である。"
+  },
+  {
+   "id": "E-28",
+   "title": "実値を式そのものとして評価するとどうなるか（同上）",
+   "command": "ValueExpression(<パスワード実値>).resolveString(resolver) を実行した。実値を .cli / standalone.xml に直書きした場合に相当する。",
+   "result": "pa${}ss              -> EXCEPTION IllegalArgumentException: key can't be empty\npa${ss               -> EXCEPTION IllegalStateException: Incomplete expression: pa\n${}                  -> EXCEPTION IllegalArgumentException: key can't be empty\npa$${ss              -> [pa${ss]   （$$ が $ のエスケープとして働く）\n${env.JBOSS_MASTER_PASSWORD} -> [RESOLVED_PW]  （別の値に化ける）\npa${env.NOT_SET}ss   -> EXCEPTION IllegalStateException: Failed to resolve expression\npa${env.NOT_SET:def}ss -> [padefss]\npa\\nss               -> [pa\\nss]",
+   "meaning": "直書きに変えた瞬間、${ と ${} はサーバ起動を止める（B-26）。パスワードが偶然 ${env.…} の形をしていると、まったく別の値として解決されてしまう点も重大。エスケープは $$ である。"
+  },
+  {
+   "id": "E-29",
+   "title": "standalone.xml に実値を直書きした場合の XML 属性値正規化",
+   "command": "<credential-reference clear-text=\"<値>\"/> を組み立てて DOM で読み戻し、書込値と読出値を 16 進で比較した。",
+   "result": "実 LF（内部） 70 61 0A 73 73 -> 70 61 20 73 73  ★空白へ正規化\n実 LF（末尾） 70 61 73 73 0A -> 70 61 73 73 20  ★空白へ正規化\n実 CR         70 61 0D 73 73 -> 70 61 20 73 73  ★空白へ正規化\nTAB           70 61 09 73 73 -> 70 61 20 73 73  ★空白へ正規化\n\\n 2 文字 / ${} / ${ / 半角スペース / 末尾半角スペース -> いずれも一致",
+   "meaning": "XML 1.0 の属性値正規化により、改行・復帰・タブは空白 1 個へ無言で置換される。--resolve-parameter-values を付けて実値を XML へ書き出すと、ストア作成時の値と起動時の値がここで食い違う。\\n の 2 文字と ${} は影響を受けない。"
+  },
+  {
+   "id": "E-30",
+   "title": "前版 9.3 の grep による範囲チェックは改行を検出できるか",
+   "command": "printf '%s' \"$値\" | LC_ALL=C grep -q '[^ -~]' を各値に対して実行した。",
+   "result": "70 61 0A 73 73（内部改行） -> ★検出できず（見逃し）\n70 61 73 73 0A（末尾改行） -> ★検出できず（見逃し）\n70 61 09 73 73（タブ）     -> 検出\n70 C3 A9（非 ASCII）       -> 検出",
+   "meaning": "grep は行指向なので LF は行区切りとして消費され、内容として検査されない。最も多い事故パターンである『Enter による改行』をちょうど見逃す。od で 16 進化してから判定する方式へ差し替えた（B-28、第 6 章 0.）。"
+  }
+ ],
+ "env_premise": [
+  {
+   "component": "アプリケーションサーバ",
+   "version": "JBoss EAP 8.1",
+   "property": "Elytron のみ（legacy security subsystem は EAP 8 で削除済み）。credential-store の既定実装は KeyStoreCredentialStore で、実体は JCEKS キーストア。add-user.sh は properties-realm 用に引き続き同梱される。"
+  },
+  {
+   "component": "ベースイメージ",
+   "version": "UBI 9.8 (RHEL 9 系)",
+   "property": "/bin/sh は bash へのシンボリックリンク（RHEL 9 に dash は同梱されない）。bash は 5.1.8 系。したがって Dockerfile の RUN 既定シェル /bin/sh -c も bash であり、export の宣言コマンド規則・[[ ]]・BASH_REMATCH・compgen はすべて利用できる。"
+  },
+  {
+   "component": "JVM",
+   "version": "OpenJDK 21 (Red Hat build)",
+   "property": "JCEKS の秘密鍵エントリは SunJCE の PBEWithMD5AndTripleDES で保護される。その鍵導出 (com.sun.crypto.provider.PBEKey) はパスワードを印字可能 ASCII に限定する。これが本環境における最も強い制約。"
+  },
+  {
+   "component": "資格情報ストア",
+   "version": "secrets.jceks (JCEKS)",
+   "property": "ストア整合性は SHA-1 ベースの MAC、各エントリは PBE で保護される。両者でパスワードの受理範囲が異なる点が重要（後述 EV-01）。"
+  },
+  {
+   "component": "シークレット管理",
+   "version": "AWS Systems Manager Parameter Store (SecureString) / Secrets Manager",
+   "property": "Value / SecretString に文字種のパターン制約が無く（実測 E-20）、KMS 復号もバイト透過。壊れるのは AWS ではなく登録経路と取得経路の側である。"
+  },
+  {
+   "component": "登録・取得クライアント",
+   "version": "AWS CLI v1 1.46.1 / botocore 1.43（v2 でも --value の無解釈は同じ）",
+   "property": "--value はエスケープ解釈をしない。--cli-input-json は JSON デコードを行う。--output text は末尾に LF を 1 個足す。"
+  }
+ ],
+ "env_items": [
+  {
+   "id": "EV-01",
+   "severity": "最重要",
+   "body": "JCEKS の秘密鍵エントリ保護は印字可能 ASCII (0x20-0x7E) しか受理しない\n\n【根拠】SunJCE の PBEWithMD5AndTripleDES 鍵導出（com.sun.crypto.provider.PBEKey）が、パスワード中の文字を 0x20〜0x7E に限定している。範囲外の文字が 1 つでもあると InvalidKeySpecException: Password is not ASCII で失敗する。0x00-0xFF の全 256 文字を走査し、受理されたのは 0x20-0x7E の 95 文字のみであることを実測した。",
+   "impact": "【影響】タブ (0x09)・改行 (0x0A)・復帰 (0x0D) は JBOSS_MASTER_PASSWORD に使用できない。シェル側をどれだけ修正しても、資格情報ストアそのものが受け付けない。非 ASCII（日本語・アクセント付きラテン文字など）も同様に使用できない。半角スペース (0x20) とバックスラッシュ (0x5C) は範囲内のため JCEKS 層では問題ない。\n\n【対処】パスワードを 0x20-0x7E に限定する。ポリシーとしてタブ・改行・復帰・非 ASCII を禁止する。"
+  },
+  {
+   "id": "EV-02",
+   "severity": "最重要",
+   "body": "空のストア作成は成功し、最初のエイリアス登録で初めて失敗する\n\n【根拠】キーストアの整合性 MAC は任意の文字を受理するのに対し、秘密鍵エントリの PBE 保護のみが ASCII 制限を持つ。SecretKeyEntry を入れずに store()/load() する経路ではタブ・改行・非 ASCII でも すべて成功することを実測した。失敗が起きるのは setEntry(SecretKeyEntry) の時点である。",
+   "impact": "【影響】base.cli の create=true による空ストア作成はビルド時に成功してしまう。その後の store_credentials.sh の --add、あるいは実行時の最初の資格情報登録で初めて Password is not ASCII が出る。ビルドは通るのに起動時に落ちるという、最も切り分けづらい失敗の仕方をする。\n\n【対処】ビルド時に空ストア作成だけで検証を済ませない。ダミーエイリアスを 1 件登録・削除して疎通確認するか、シェル側で 0x20-0x7E の範囲チェックを先に行う。"
+  },
+  {
+   "id": "EV-03",
+   "severity": "重大",
+   "body": "RUN --mount の env= オプションは Dockerfile frontend v1.10.0 以降が必要\n\n【根拠】docker 公式リファレンスは env について \"Mount the secret to an environment variable instead of a file, or both. (since Dockerfile v1.10.0)\" と明記している。提示された Dockerfile には # syntax ディレクティブが無く、既定 frontend が v1.10.0 未満だと env= が解釈されない。",
+   "impact": "【影響】env= が無視されると JBOSS_MASTER_PASSWORD が設定されないまま RUN が走る。: \"${JBOSS_MASTER_PASSWORD:?}\" のチェックがあるので即失敗するが、原因が secret 未指定なのか frontend 古さなのか切り分けにくい。\n\n【対処】Dockerfile 先頭に # syntax=docker/dockerfile:1.10 （以降のバージョンでも可）を明記する。"
+  },
+  {
+   "id": "EV-04",
+   "severity": "重大",
+   "body": "podman / buildah でビルドする場合 env= の意味が異なる\n\n【根拠】podman の --secret オプションにおける env= は「シークレット値の読み取り元となるホスト側の環境変数名」を指すソース指定であり、docker の Containerfile 側 env=（宛先指定）とは意味が異なる。podman-build のドキュメントは RUN --mount=type=secret について id と target/dst/destination のみを記載しており、env= を宛先として挙げていない。UBI ベースの構成では podman build が使われることが多い。",
+   "impact": "【影響】podman でビルドすると env= が宛先として機能せず、環境変数が設定されない可能性がある。その場合 /run/secrets/<id> にファイルとしてのみマウントされる。\n\n【対処】ビルドに使うツールを確定させる。podman を使うなら env= に依存せず JBOSS_MASTER_PASSWORD=\"$(cat /run/secrets/jboss_master_password)\" の形でファイルから読む。その際も末尾 LF の除去が必要（EV-05）。"
+  },
+  {
+   "id": "EV-05",
+   "severity": "重大",
+   "body": "シークレットファイル末尾の LF が JCEKS の ASCII 制限に直撃する\n\n【根拠】BuildKit も podman もシークレットの内容をバイト列のまま渡す。echo で生成したファイルには末尾に LF が付く。従来これは「ビルド時と実行時で値が食い違う」という問題だったが、本環境では EV-01 により LF そのものが資格情報ストアに格納できないため、Password is not ASCII という別のエラーとして現れる。",
+   "impact": "【影響】末尾 LF 付きのシークレットを使うと、空ストア作成は通り、エイリアス登録で失敗する。エラーメッセージからは末尾 LF が原因だと読み取れない。\n\n【対処】printf '%s' でシークレットを生成する。読み込み側でも JBOSS_MASTER_PASSWORD=\"${JBOSS_MASTER_PASSWORD%$'\\n'}\" 等で末尾 LF を除去し、さらに 0x20-0x7E の範囲チェックを行う。"
+  },
+  {
+   "id": "EV-06",
+   "severity": "中",
+   "body": "EAP 8.1 の elytron-tool.sh は eval と '\"$@\"' を使っており値は再展開されない\n\n【根拠】upstream wildfly-core の elytron-tool.sh 末尾は eval \\\"$JAVA\\\" $JAVA_OPTS -jar ... org.wildfly.security.elytron-tool '\"$@\"' の形。eval が再パースするのはテキスト \"$@\" であり、位置パラメータの展開結果は再展開されない。",
+   "impact": "【影響】S6 の判定（全文字 OK）は EAP 8.1 でもそのまま成立する。ただし $JAVA_OPTS は非クォートのまま eval に渡るため、そちらに特殊文字を入れると危険。\n\n【対処】パスワード側の対処は不要。JAVA_OPTS に信頼できない値を入れないこと。"
+  },
+  {
+   "id": "EV-07",
+   "severity": "中",
+   "body": "コンテナのロケール未設定時、JVM の sun.jnu.encoding が ASCII になる\n\n【根拠】JDK 18 以降 file.encoding は UTF-8 が既定になったが、コマンドライン引数・環境変数・ファイルパスの復号に使われる sun.jnu.encoding はプラットフォームのロケールに従う。LANG / LC_ALL が未設定または C / POSIX の場合 ANSI_X3.4-1968 (ASCII) となり、非 ASCII バイトは ? に置換される。",
+   "impact": "【影響】System.getenv() および argv 経由で渡したパスワードが壊れる。ただし本環境では EV-01 により非 ASCII は元々使用できないため、0x20-0x7E に限れば実害は生じない。\n\n【対処】非 ASCII を使わない運用であれば対処不要。確認する場合は podman exec <ctr> java -XshowSettings:properties -version 2>&1 | grep jnu。"
+  },
+  {
+   "id": "EV-08",
+   "severity": "参考",
+   "body": "FIPS モードでは JCEKS 自体が利用できない\n\n【根拠】RHEL 9 を FIPS モードで運用する場合、MD5 を用いる PBEWithMD5AndTripleDES が使用できないため JCEKS 形式の資格情報ストアは作成できない。",
+   "impact": "【影響】fips-mode-setup --enabled のホスト上では、本構成はそもそも起動しない。\n\n【対処】FIPS 環境では credential-store の type を変更するか、EAP 8 の secret-key-credential-store / 暗号化式 (${ENC::...}) への移行を検討する。"
+  },
+  {
+   "id": "EV-09",
+   "severity": "最重要",
+   "body": "パラメータストアは JCEKS が扱えない値を何の警告もなく保存する\n\n【根拠】PutParameter の Value はサービスモデル上 min/max すら持たず、文字種のパターン制約が存在しない（実測 E-20）。CreateSecret の SecretString も min/max のみ。PEM 秘密鍵のような複数行の値を SecureString に格納するのは公式に想定された用途であり、この挙動が将来変わることは期待できない。",
+   "impact": "【影響】Enter で改行を入れたパスワードも、末尾で Enter を押したパスワードも、タブも非 ASCII も、登録は成功する。失敗は最初のエイリアス登録（ビルド時）または資格情報ストアのオープン（起動時）まで遅延し、EV-02 と重なって最も切り分けづらい壊れ方をする。\n\n【対処】put-parameter の前段に 0x20-0x7E の範囲チェックを置き、登録そのものを拒否する（第 6 章 0-b）。AWS 側での検出を当てにしない。"
+  },
+  {
+   "id": "EV-10",
+   "severity": "最重要",
+   "body": "取得経路が末尾の改行を無言で落とす／足す\n\n【根拠】aws ... --output text は値の後ろに必ず LF を 1 個足す（実測 E-21）。$( ) は末尾の LF を個数に関わらずすべて除去する（実測 E-23）。逆にリダイレクトで保存すると CLI が足した LF がファイルに残る（実測 E-24）。",
+   "impact": "【影響】末尾に Enter を含むパスワードは、登録値と起動時の値が 1 バイト食い違う。JCEKS はそもそも末尾 LF を拒否するため（EV-01）、運が良ければ Password is not ASCII で落ち、運が悪ければ『落ちた LF のぶんだけ短い別の値』でストアが作られて後日の再起動で開けなくなる。\n\n【対処】--output json で取得し jq -j -r（-j は末尾改行を出力しない）でファイルへ直接書き出す（第 6 章 0-c）。"
+  },
+  {
+   "id": "EV-11",
+   "severity": "重大",
+   "body": "同じ『\\n』という入力が経路ごとに別のバイト列になる\n\n【根拠】実測 E-19 のとおり、--value 'pa\\nss' は 5C 6E の 2 文字として、--cli-input-json の \"pa\\nss\" は JSON デコードを経て 0A の 1 文字として送られる。マネジメントコンソールのテキストエリアで Enter を押した場合も 0A になる。bash のダブルクォート \"pa\\nss\" は \\n を解釈しないため 2 文字のままである。",
+   "impact": "【影響】『改行を入れたつもり』と『2 文字を入れたつもり』が取り違えられる。前者（実 LF）は JCEKS で落ち、後者（2 文字）は JCEKS を通るが store_credentials.sh の read が panss に潰す（実測 E-26）。どちらに転んでも壊れるが、壊れ方も現れる場所も違うため調査が迷走する。\n\n【対処】登録は --value file:// の 1 経路に統一し、登録直後に get-parameter して 16 進で照合する（第 6 章 0-b の手順 5）。"
+  },
+  {
+   "id": "EV-12",
+   "severity": "中",
+   "body": "実値を式として評価する位置に置くと ${ と ${} が起動を止める\n\n【根拠】実測 E-27 のとおり、現行の ${env.JBOSS_MASTER_PASSWORD} 方式では ValueExpression が解決結果を再走査しないため ${ も ${} も無害である。一方 実測 E-28 のとおり、同じ文字列を式そのものとして評価すると ${ は IllegalStateException: Incomplete expression、${} は IllegalArgumentException: key can't be empty を送出する。--resolve-parameter-values 付きの jboss-cli 実行、add-alias(secret-value=\"実値\")、standalone.xml への実値書き出しがこれに該当する。",
+   "impact": "【影響】パスワードに ${ や ${} を含めている環境では、CLI の書き方を変えただけで突然起動しなくなる。さらにパスワードが偶然 ${env.…} の形をしていると、例外ではなく『別の値に解決される』という最悪の挙動になる（実測 E-28）。\n\n【対処】実値を .cli / XML に直書きしない設計を維持する。直書きが避けられない場合は $ を $$ にエスケープする。"
+  },
+  {
+   "id": "EV-13",
+   "severity": "中",
+   "body": "ECS / Kubernetes / compose の値補間は経路ごとに規則が違う\n\n【根拠】ECS タスク定義の secrets[].valueFrom による注入は environ への直接設定であり再解釈は起きない。Kubernetes は Pod の env 値と command/args に含まれる $(VAR) を展開する（エスケープは $$( ）が、${...} 形式は展開しない。docker compose が補間するのは compose ファイル側であり env_file の値ではない。docker run --env-file は行指向テキストなので LF を含む値を表現できない。",
+   "impact": "【影響】${ を含むパスワードは k8s では無害だが、$( を含むパスワードは k8s で壊れる。--env-file を使う構成だけが改行・行頭 #・行末空白の問題を抱える。\n\n【対処】ECS secrets / -e / シークレットファイルの直渡しに寄せる。--env-file を使わない。"
+  }
+ ],
+ "env_commands": "# 1) /bin/sh の実体と bash のバージョン\npodman exec <ctr> sh -c 'ls -l /bin/sh; bash --version | head -1'\n\n# 2) JVM のエンコーディング設定（非 ASCII を扱う場合のみ関係する）\npodman exec <ctr> java -XshowSettings:properties -version 2>&1 \\\n    | grep -E 'sun.jnu.encoding|file.encoding|java.version'\n\n# 3) JCEKS が受け付けるパスワードかを事前に判定する（シェルだけで完結）\n#    注意: 前版に記載した grep 方式は誤りだった。grep は行指向なので LF を\n#    「内容」として検査できず、内部改行・末尾改行をちょうど見逃す（実測 E-30）。\n#    od で 16 進化してからバイト単位で判定すること。\nhex=$(printf '%s' \"$JBOSS_MASTER_PASSWORD\" | od -An -v -tx1 | tr -d ' \\n')\nng=0\nfor (( i=0; i<${#hex}; i+=2 )); do\n    b=$(( 16#${hex:i:2} ))\n    (( b < 0x20 || b > 0x7e )) && ng=1\ndone\n[ \"$ng\" = 1 ] \\\n    && echo \"NG: printable ASCII (0x20-0x7E) 以外を含む  bytes=${hex}\" \\\n    || echo \"OK: JCEKS に格納可能  bytes=${hex}\"\n\n# 3b) パラメータストアに登録されている値を 16 進で確認する\n#     --output text と $( ) は末尾 LF を壊すので使わない（実測 E-21 / E-23）\naws ssm get-parameter --name /jboss/master_password --with-decryption --output json \\\n    | jq -j -r '.Parameter.Value' | od -An -v -tx1 | tr -d ' \\n'; echo\n\n# 4) 資格情報ストアに実際に 1 件登録できるかを確認する\n#    空ストア作成だけでは検証にならない（EV-02）\n\"${JBOSS_HOME}/bin/elytron-tool.sh\" credential-store \\\n    --location /tmp/probe.jceks --password \"$JBOSS_MASTER_PASSWORD\" --create\n\"${JBOSS_HOME}/bin/elytron-tool.sh\" credential-store \\\n    --location /tmp/probe.jceks --password \"$JBOSS_MASTER_PASSWORD\" \\\n    --add probe --secret dummy\nrm -f /tmp/probe.jceks",
+ "notation_table": [
+  {
+   "typed": "pass",
+   "route": "コンソールのテキストエリアに普通に入力",
+   "stored": "70 61 73 73",
+   "env_recommended": "70 61 73 73",
+   "env_current": "70 61 73 73",
+   "jceks": "OK",
+   "s5": "[pass]",
+   "verdict": "問題なし"
+  },
+  {
+   "typed": "pa<Enter>ss",
+   "route": "コンソールで途中に Enter を押して改行",
+   "stored": "70 61 0A 73 73",
+   "env_recommended": "70 61 0A 73 73",
+   "env_current": "70 61 0A 73 73",
+   "jceks": "NG (Password is not ASCII)",
+   "s5": "エイリアス注入が成立（実測 E-08）",
+   "verdict": "致命的。登録は成功するが起動時に落ちる。エイリアス注入も成立する"
+  },
+  {
+   "typed": "pass<Enter>",
+   "route": "コンソールで末尾に Enter を押す（見た目は変わらない）",
+   "stored": "70 61 73 73 0A",
+   "env_recommended": "70 61 73 73 0A",
+   "env_current": "70 61 73 73",
+   "jceks": "NG (Password is not ASCII)",
+   "s5": "[pass]  ★末尾 LF が read で除去される（実測 E-02）",
+   "verdict": "致命的かつ無言。現行取得経路では末尾 LF が消え、登録値と別物になる"
+  },
+  {
+   "typed": "pa\\nss",
+   "route": "aws ssm put-parameter --value 'pa\\nss'（シングルクォート）",
+   "stored": "70 61 5C 6E 73 73",
+   "env_recommended": "70 61 5C 6E 73 73",
+   "env_current": "70 61 5C 6E 73 73",
+   "jceks": "OK",
+   "s5": "[panss]  ★原値と異なる",
+   "verdict": "JCEKS は通るが現行 S5 で panss に化ける。改行にはならない"
+  },
+  {
+   "typed": "pa\\nss",
+   "route": "aws ssm put-parameter --value $'pa\\nss'（bash の ANSI-C クォート）",
+   "stored": "70 61 0A 73 73",
+   "env_recommended": "70 61 0A 73 73",
+   "env_current": "70 61 0A 73 73",
+   "jceks": "NG (Password is not ASCII)",
+   "s5": "エイリアス注入が成立（実測 E-08）",
+   "verdict": "実 LF になる。致命的"
+  },
+  {
+   "typed": "pa\\nss",
+   "route": "--cli-input-json '{\"Value\":\"pa\\nss\"}'（JSON の \\n）",
+   "stored": "70 61 0A 73 73",
+   "env_recommended": "70 61 0A 73 73",
+   "env_current": "70 61 0A 73 73",
+   "jceks": "NG (Password is not ASCII)",
+   "s5": "エイリアス注入が成立（実測 E-08）",
+   "verdict": "JSON デコードで実 LF になる。致命的"
+  },
+  {
+   "typed": "pa\\\\nss",
+   "route": "--cli-input-json '{\"Value\":\"pa\\\\nss\"}'（JSON の \\\\n）",
+   "stored": "70 61 5C 6E 73 73",
+   "env_recommended": "70 61 5C 6E 73 73",
+   "env_current": "70 61 5C 6E 73 73",
+   "jceks": "OK",
+   "s5": "[panss]  ★原値と異なる",
+   "verdict": "2 文字として保存される。上と同じ見た目の指定で結果が逆になる"
+  },
+  {
+   "typed": "pass",
+   "route": "echo pass > pw.txt して --value file://pw.txt",
+   "stored": "70 61 73 73 0A",
+   "env_recommended": "70 61 73 73 0A",
+   "env_current": "70 61 73 73",
+   "jceks": "NG (Password is not ASCII)",
+   "s5": "[pass]  ★末尾 LF が read で除去される（実測 E-02）",
+   "verdict": "末尾 LF が混入する。致命的"
+  },
+  {
+   "typed": "pass",
+   "route": "printf '%s' pass > pw.txt して --value file://pw.txt",
+   "stored": "70 61 73 73",
+   "env_recommended": "70 61 73 73",
+   "env_current": "70 61 73 73",
+   "jceks": "OK",
+   "s5": "[pass]",
+   "verdict": "問題なし。推奨経路"
+  },
+  {
+   "typed": "pa${}ss",
+   "route": "aws ssm put-parameter --value 'pa${}ss'",
+   "stored": "70 61 24 7B 7D 73 73",
+   "env_recommended": "70 61 24 7B 7D 73 73",
+   "env_current": "70 61 24 7B 7D 73 73",
+   "jceks": "OK",
+   "s5": "[pa${}ss]",
+   "verdict": "現行設計では問題なし。実値を .cli / XML に直書きすると key can't be empty で起動不能"
+  },
+  {
+   "typed": "pa${ss",
+   "route": "aws ssm put-parameter --value 'pa${ss'",
+   "stored": "70 61 24 7B 73 73",
+   "env_recommended": "70 61 24 7B 73 73",
+   "env_current": "70 61 24 7B 73 73",
+   "jceks": "OK",
+   "s5": "[pa${ss]",
+   "verdict": "現行設計では問題なし。直書きすると Incomplete expression で起動不能"
+  },
+  {
+   "typed": "pa${ss",
+   "route": "aws ssm put-parameter --value \"pa${ss\"（ダブルクォート）",
+   "stored": "—（登録に至らない）",
+   "env_recommended": "—",
+   "env_current": "—",
+   "jceks": "—",
+   "s5": "—",
+   "verdict": "bash が不正な変数展開としてエラーにする。値は必ずシングルクォートで囲む"
+  },
+  {
+   "typed": "pa!ss",
+   "route": "対話シェルから --value \"pa!ss\"（ダブルクォート）",
+   "stored": "履歴展開後の別の値",
+   "env_recommended": "—",
+   "env_current": "—",
+   "jceks": "—",
+   "s5": "—",
+   "verdict": "履歴展開で別の値が登録される。AWS 側に検証が無いため気付けない（B-30）"
+  },
+  {
+   "typed": "{\"password\":\"pa\\nss\"}",
+   "route": "Secrets Manager に JSON で格納し jq -r .password で取得",
+   "stored": "7B 22 70 61 73 73 77 6F 72 64 22 3A 22 70 61 5C 6E 73 73 22 7D",
+   "env_recommended": "70 61 0A 73 73",
+   "env_current": "70 61 0A 73 73",
+   "jceks": "NG (Password is not ASCII)",
+   "s5": "エイリアス注入（実測 E-08）",
+   "verdict": "JSON の \\n は jq -r で実 LF になる。致命的"
+  },
+  {
+   "typed": "{\"password\":\"pa\\nss\"}",
+   "route": "Secrets Manager に JSON で格納し --query SecretString --output text で生取り",
+   "stored": "7B 22 70 61 73 73 77 6F 72 64 22 3A 22 70 61 5C 6E 73 73 22 7D",
+   "env_recommended": "7B 22 70 61 73 73 77 6F 72 64 22 3A 22 70 61 5C 6E 73 73 22 7D",
+   "env_current": "7B 22 70 61 73 73 77 6F 72 64 22 3A 22 70 61 5C 6E 73 73 22 7D",
+   "jceks": "OK",
+   "s5": "[{\"password\":\"panss\"}]  ★原値と異なる",
+   "verdict": "JSON テキスト全体がパスワードになる。取り出し方次第で値が変わる設計自体が危険"
+  }
+ ],
+ "notation_note": "同じ見た目の入力が、経路ごとに別のバイト列としてパラメータストアへ入る。AWS 側に文字種の検証が無い以上（実測 E-20）、ここを取り違えても登録は必ず成功し、失敗はビルドまたは起動まで遅延する。列の意味は次のとおり。\n・保存される値 = パラメータストアに実際に格納されるバイト列（実測 E-19）\n・推奨経路で届く値 = --output json | jq -j -r でファイルへ書いた場合（第 6 章 0-c）\n・現行経路で届く値 = PW=$(aws ... --output text) で受けた場合（実測 E-21 / E-23）\n・現行 S5 の結果 = 未修正の store_credentials.sh が資格情報ストアへ登録する値（実測 E-26 / E-08）"
+}
